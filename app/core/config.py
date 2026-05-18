@@ -7,7 +7,7 @@ class Settings(BaseSettings):
 
     # OpenAI — required at runtime, optional at startup
     openai_api_key: str = ""
-    openai_model_id: str = "gpt-4o-mini"
+    openai_model_id: str = "gpt-4.1-nano"
     openai_embedding_model: str = "text-embedding-3-small"
 
     # Supabase — wajib ada
@@ -22,4 +22,4 @@ class Settings(BaseSettings):
     # App
     log_level: str = "INFO"
 
-settings = Settings()
+settings = Settings()

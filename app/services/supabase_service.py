@@ -99,7 +99,8 @@ class SupabaseService:
             oai = _get_openai_client()
             response = await oai.embeddings.create(
                 input=query,
-                model=settings.openai_embedding_model
+                model=settings.openai_embedding_model,
+                dimensions=768
             )
             query_embedding = response.data[0].embedding
 
