@@ -12,9 +12,7 @@ from app.engine.recommender import cluster_and_rank_pois
 
 mcp = FastMCP("SobatNavi", version="4.0.0")
 
-# =====================================================================
 # MCP TOOLS
-# =====================================================================
 
 @mcp.tool()
 async def get_bali_context(
@@ -41,23 +39,25 @@ async def get_bali_context(
 
 @mcp.tool()
 async def get_smart_recommendations(
-    query: str = Field(..., description="Kata kunci tema wisata (misal: 'pantai sunset', 'budaya ubud')"),
-    num_days: int = Field(1, description="Jumlah hari (menentukan jumlah cluster DBSCAN)"),
-    limit_per_day: int = Field(4, description="Jumlah tempat wisata per hari (disarankan 3-5)"),
-    category: str = Field("poi", description="Kategori: 'poi', 'hotel', atau 'restaurant'")
+    query: str = Field(..., description="Kata kunci tema wisata"),
+    num_days: int = Field(1, description="Jumlah hari"),
+    limit_per_day: int = Field(4, description="Tempat per hari"),
+    category: str = Field("poi", description="'poi', 'hotel', atau 'restaurant'"),
+    preference_mode: str = Field("standard", description="'standard', 'hidden_gem', 'luxury', 'budget'")
 ) -> list[dict]:
-    """
-    Mencari tempat wisata menggunakan Semantic RAG Search, mengelompokkan agar
-    berdekatan per hari (DBSCAN Haversine), dan memilih terbaik dengan
-    TOPSIS multi-dimensi sesuai kategori.
-    """
-    # Gunakan semantic search (BUKAN keyword search biasa)
-    raw_pois = await supabase_service.search_pois_semantic(query=query, limit=40)
+    """Cari tempat wisata dengan Semantic RAG, DBSCAN, dan TOPSIS."""
+    if category == "hotel":
+        raw_pois = await supabase_service.search_amenities_semantic(query, "hotel", limit=40)
+    elif category == "restaurant":
+        raw_pois = await supabase_service.search_amenities_semantic(query, "restaurant", limit=40)
+    else:
+        raw_pois = await supabase_service.search_pois_semantic(query=query, limit=40)
     return cluster_and_rank_pois(
         raw_pois,
         num_clusters=num_days,
         top_n_per_cluster=limit_per_day,
         category=category,
+        preference_mode=preference_mode,
     )
 
 
@@ -89,24 +89,29 @@ async def search_amenities_nearby(
 
 @mcp.tool()
 async def validate_itinerary_safety(
-    poi_ids: List[int] = Field(..., description="Daftar ID POI yang akan dikunjungi"),
-    date_start: str = Field(..., description="Tanggal mulai perjalanan (YYYY-MM-DD)"),
-    date_end: str = Field(..., description="Tanggal selesai perjalanan (YYYY-MM-DD)")
+    poi_ids: list,
+    date_start: str,
+    date_end: str
 ) -> dict:
     """
-    Mengecek apakah POI-POI yang dipilih terblokir oleh upacara Odalan pada tanggal perjalanan.
+    Mengecek apakah POI-POI yang dipilih terblokir oleh upacara Odalan.
+    Gunakan place_id (string) dari hasil get_smart_recommendations.
     """
+    from app.engine.odalan_checker import evaluate_odalan_status
     active_odalans = await supabase_service.get_all_active_odalans(date_start, date_end)
     blocked_pois = []
-
     for poi_id in poi_ids:
-        check = evaluate_odalan_status(poi_id, active_odalans)
+        check = evaluate_odalan_status(str(poi_id), active_odalans)
         if check.status == "BLOCKED":
             blocked_pois.append({"poi_id": poi_id, "reason": check.message})
-
-    if blocked_pois:
-        return {"status": "CONFLICT", "blocked_pois": blocked_pois}
-    return {"status": "SAFE", "message": "Semua POI aman dari konflik Odalan."}
+    return {
+        "status": "CONFLICT" if blocked_pois else "SAFE",
+        "blocked_pois": blocked_pois,
+        "message": (
+            f"⚠️ {len(blocked_pois)} tempat terblokir Odalan!" if blocked_pois
+            else "✅ Semua POI aman dari konflik Odalan."
+        )
+    }
 
 
 @mcp.tool()
@@ -155,9 +160,7 @@ async def calculate_route_with_avoidance(
         return await tomtom_service.get_fallback_route(origin_lat, origin_lng, dest_lat, dest_lng)
 
 
-# =====================================================================
 # MCP PROMPTS
-# =====================================================================
 
 @mcp.prompt("heidi_persona")
 def heidi_persona() -> str:

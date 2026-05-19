@@ -33,11 +33,11 @@ POI_SELECT_COLS = (
 
 # Kolom untuk hotel/restoran
 AMENITY_SELECT_COLS = (
-    "id, place_id, name, district, latitude, longitude, "
-    "rating, user_rating_count, image_url, metadata"
+    "place_id, name, district, latitude, longitude, "
+    "rating, user_rating_count, image_url, price_level, metadata"
 )
 
-# Kolom user_itineraries (sesuai schema Supabase aktual — tanpa cover_image_url & district_tags)
+# Kolom user_itineraries (sesuai schema Supabase aktual)
 ITINERARY_LIST_COLS = (
     "id, user_id, title, description, days_count, total_budget_idr, "
     "is_public, share_slug, created_at, updated_at"
@@ -48,28 +48,31 @@ class SupabaseService:
     def __init__(self):
         self.client: Client = create_client(settings.supabase_url, settings.supabase_service_key)
 
-    # =====================================================================
+    # =========================================================================
     # ODALAN
-    # =====================================================================
+    # =========================================================================
 
     @retry_with_backoff(retries=3)
     async def get_all_active_odalans(self, date_start: str, date_end: str) -> list[dict]:
         """Mengambil semua upacara Odalan aktif dalam rentang tanggal."""
-        result = await asyncio.to_thread(
-            self.client.table("odalan_events").select(
-                "id, poi_attraction_id, location_name, start_time, end_time, "
-                "north_east_latitude, north_east_longitude, "
-                "south_west_latitude, south_west_longitude"
+        def _fetch():
+            return (
+                self.client.table("odalan_events")
+                .select(
+                    "id, poi_attraction_id, location_name, start_time, end_time, "
+                    "north_east_latitude, north_east_longitude, "
+                    "south_west_latitude, south_west_longitude"
+                )
+                .lt("start_time", date_end)
+                .gt("end_time", date_start)
+                .execute()
             )
-            .gte("end_time", date_start)
-            .lte("start_time", date_end)
-            .execute
-        )
+        result = await asyncio.to_thread(_fetch)
         return result.data or []
 
-    # =====================================================================
+    # =========================================================================
     # POI SEARCH
-    # =====================================================================
+    # =========================================================================
 
     @retry_with_backoff(retries=3)
     async def search_pois_semantic(
@@ -86,16 +89,17 @@ class SupabaseService:
         Semua parameter filter bersifat opsional.
         """
         if not query:
-            result = await asyncio.to_thread(
-                self.client.table("poi_attractions")
-                .select(POI_SELECT_COLS)
-                .limit(limit)
-                .execute
-            )
+            def _fetch():
+                return (
+                    self.client.table("poi_attractions")
+                    .select(POI_SELECT_COLS)
+                    .limit(limit)
+                    .execute()
+                )
+            result = await asyncio.to_thread(_fetch)
             return result.data or []
 
         try:
-            # 1. Buat embedding dari query
             oai = _get_openai_client()
             response = await oai.embeddings.create(
                 input=query,
@@ -104,19 +108,19 @@ class SupabaseService:
             )
             query_embedding = response.data[0].embedding
 
-            # 2. Panggil RPC match_poi_attractions dengan semua parameter yang dibutuhkan
-            # (semua filter opsional, kirim None jika tidak diset)
             rpc_params = {
                 "query_embedding": query_embedding,
                 "match_count": limit,
-                "filter_district": filter_district,       # NULL = tidak filter
-                "filter_category": filter_category,       # NULL = tidak filter
-                "filter_price_level": filter_price_level, # NULL = tidak filter
-                "filter_min_rating": filter_min_rating,   # NULL = tidak filter
+                "filter_district": filter_district,
+                "filter_category": filter_category,
+                "filter_price_level": filter_price_level,
+                "filter_min_rating": filter_min_rating,
             }
-            result = await asyncio.to_thread(
-                self.client.rpc("match_poi_attractions", rpc_params).execute
-            )
+
+            def _fetch():
+                return self.client.rpc("match_poi_attractions", rpc_params).execute()
+
+            result = await asyncio.to_thread(_fetch)
             data = result.data or []
             logger.info(f"Semantic search '{query}': {len(data)} hasil")
             return data
@@ -137,18 +141,95 @@ class SupabaseService:
             f'content.ilike."%{safe_query}%",'
             f'district.ilike."%{safe_query}%"'
         )
-        result = await asyncio.to_thread(
-            self.client.table("poi_attractions")
-            .select(POI_SELECT_COLS)
-            .or_(search_filter)
-            .limit(limit)
-            .execute
-        )
+
+        def _fetch():
+            return (
+                self.client.table("poi_attractions")
+                .select(POI_SELECT_COLS)
+                .or_(search_filter)
+                .limit(limit)
+                .execute()
+            )
+
+        result = await asyncio.to_thread(_fetch)
         return result.data or []
 
-    # =====================================================================
+    async def search_pois_nearby(
+        self, lat: float, lng: float, radius_m: float = 3000, limit: int = 10
+    ) -> list[dict]:
+        """Mencari POI terdekat menggunakan PostGIS via RPC (fallback ke semantic jika gagal)."""
+        try:
+            def _fetch():
+                return self.client.rpc("search_pois_nearby", {
+                    "lat": lat,
+                    "lng": lng,
+                    "radius_m": radius_m,
+                    "result_limit": limit,
+                }).execute()
+
+            result = await asyncio.to_thread(_fetch)
+            return result.data or []
+        except Exception as e:
+            logger.warning(f"search_pois_nearby RPC gagal ({e}), fallback semantic.")
+            return await self.search_pois_semantic(query="wisata bali", limit=limit)
+
+    # =========================================================================
     # AMENITY SEARCH (Hotel & Restoran)
-    # =====================================================================
+    # =========================================================================
+
+    @retry_with_backoff(retries=3)
+    async def search_amenities_semantic(
+        self,
+        query: str,
+        amenity_type: str,  # "hotel" atau "restaurant"
+        limit: int = 40,
+        filter_price_level: int = None,
+    ) -> list[dict]:
+        """
+        Pencarian hotel/restoran berdasarkan MAKNA menggunakan OpenAI Embedding + pgvector.
+        Memanggil RPC match_hotel_amenities atau match_culinary_amenities.
+        """
+        rpc_func = "match_hotel_amenities" if amenity_type == "hotel" else "match_culinary_amenities"
+
+        try:
+            oai = _get_openai_client()
+            response = await oai.embeddings.create(
+                input=query,
+                model=settings.openai_embedding_model,
+                dimensions=768
+            )
+            query_embedding = response.data[0].embedding
+
+            rpc_params = {
+                "query_embedding": query_embedding,
+                "match_count": limit,
+                "filter_price_level": filter_price_level,
+            }
+
+            def _fetch():
+                return self.client.rpc(rpc_func, rpc_params).execute()
+
+            result = await asyncio.to_thread(_fetch)
+            data = result.data or []
+            logger.info(f"Amenity semantic search '{query}' [{amenity_type}]: {len(data)} hasil")
+            return data
+
+        except Exception as e:
+            logger.warning(f"Amenity vector search gagal ({e}), fallback ke keyword search.")
+            table = "hotel_amenities" if amenity_type == "hotel" else "culinary_amenities"
+            safe_query = query.replace('"', "").strip()
+
+            def _fetch():
+                return (
+                    self.client.table(table)
+                    .select(AMENITY_SELECT_COLS)
+                    .ilike("name", f"%{safe_query}%")
+                    .limit(limit)
+                    .execute()
+                )
+
+            result = await asyncio.to_thread(_fetch)
+            return result.data or []
 
     @retry_with_backoff(retries=3)
     async def search_amenities_nearby(
@@ -162,15 +243,17 @@ class SupabaseService:
     ) -> list[dict]:
         """Mencari hotel atau restoran terdekat menggunakan PostGIS RPC."""
         rpc_func = "search_hotels_nearby" if amenity_type == "hotel" else "search_restaurants_nearby"
-        result = await asyncio.to_thread(
-            self.client.rpc(rpc_func, {
+
+        def _fetch():
+            return self.client.rpc(rpc_func, {
                 "lat": lat,
                 "lng": lng,
                 "radius_m": radius_m,
-                "max_price": max_price,   # NULL = tidak filter harga
-                "result_limit": limit
-            }).execute
-        )
+                "max_price": max_price,
+                "result_limit": limit,
+            }).execute()
+
+        result = await asyncio.to_thread(_fetch)
         return result.data or []
 
     async def search_specific_place(self, query: str, category: str = "attraction") -> list[dict]:
@@ -195,15 +278,59 @@ class SupabaseService:
         result = await asyncio.to_thread(_fetch)
         return result.data or []
 
-    # =====================================================================
-    # ITINERARY CRUD
-    # =====================================================================
+    @retry_with_backoff(retries=3)
+    async def search_inspiration_narrations(self, query: str, limit: int = 3) -> list[dict]:
+        """
+        Pencarian narasi inspiratif berdasarkan makna/vibe menggunakan OpenAI Embedding + pgvector.
+        Memanggil RPC match_inspiration_narrations.
+        """
+        try:
+            oai = _get_openai_client()
+            response = await oai.embeddings.create(
+                input=query,
+                model=settings.openai_embedding_model,
+                dimensions=768
+            )
+            query_embedding = response.data[0].embedding
 
-    async def save_user_itinerary(self, user_id: str, itinerary_data: dict) -> dict:
-        """
-        Menyimpan itinerary baru ke database (INSERT).
-        Hanya menggunakan kolom yang ada di schema aktual.
-        """
+            def _fetch():
+                return self.client.rpc("match_inspiration_narrations", {
+                    "query_embedding": query_embedding,
+                    "match_count": limit,
+                }).execute()
+
+            result = await asyncio.to_thread(_fetch)
+            data = result.data or []
+            logger.info(f"Inspiration semantic search '{query}': {len(data)} hasil")
+            return data
+
+        except Exception as e:
+            logger.warning(f"Inspiration vector search gagal ({e}), fallback ke keyword search.")
+            safe_query = query.replace('"', "").strip()
+
+            def _fetch():
+                return (
+                    self.client.table("inspiration_narrations")
+                    .select("place_id, content, metadata")
+                    .ilike("content", f"%{safe_query}%")
+                    .limit(limit)
+                    .execute()
+                )
+
+            result = await asyncio.to_thread(_fetch)
+            return result.data or []
+
+    # =========================================================================
+    # ITINERARY CRUD
+    # =========================================================================
+
+    async def save_user_itinerary(
+        self,
+        user_id: str,
+        itinerary_data: dict,
+        chat_session_id: str = None,
+    ) -> dict:
+        """Menyimpan itinerary baru ke database (INSERT)."""
         try:
             days = itinerary_data.get("itinerary_days", [])
             trip_title = itinerary_data.get("trip_title")
@@ -219,10 +346,13 @@ class SupabaseService:
                 "days_count": len(days),
                 "is_public": False,
             }
+            if chat_session_id:
+                data["chat_session_id"] = chat_session_id
 
-            result = await asyncio.to_thread(
-                self.client.table("user_itineraries").insert(data).execute
-            )
+            def _fetch():
+                return self.client.table("user_itineraries").insert(data).execute()
+
+            result = await asyncio.to_thread(_fetch)
             return result.data[0] if result.data else {}
 
         except Exception as e:
@@ -235,13 +365,16 @@ class SupabaseService:
         Akses diizinkan jika: (1) pemilik, atau (2) itinerary bersifat publik.
         """
         try:
-            result = await asyncio.to_thread(
-                self.client.table("user_itineraries")
-                .select("*")
-                .eq("id", itinerary_id)
-                .maybe_single()
-                .execute
-            )
+            def _fetch():
+                return (
+                    self.client.table("user_itineraries")
+                    .select("*")
+                    .eq("id", itinerary_id)
+                    .maybe_single()
+                    .execute()
+                )
+
+            result = await asyncio.to_thread(_fetch)
             row = result.data
             if not row:
                 return None
@@ -271,14 +404,17 @@ class SupabaseService:
         Setiap item di-annotate dengan `is_owner: bool`.
         """
         try:
-            own_result = await asyncio.to_thread(
-                self.client.table("user_itineraries")
-                .select(ITINERARY_LIST_COLS)
-                .eq("user_id", user_id)
-                .order("created_at", desc=True)
-                .range(offset, offset + limit - 1)
-                .execute
-            )
+            def _fetch_own():
+                return (
+                    self.client.table("user_itineraries")
+                    .select(ITINERARY_LIST_COLS)
+                    .eq("user_id", user_id)
+                    .order("created_at", desc=True)
+                    .range(offset, offset + limit - 1)
+                    .execute()
+                )
+
+            own_result = await asyncio.to_thread(_fetch_own)
             own_data = own_result.data or []
             for row in own_data:
                 row["is_owner"] = True
@@ -286,15 +422,18 @@ class SupabaseService:
             if not include_public:
                 return own_data
 
-            public_result = await asyncio.to_thread(
-                self.client.table("user_itineraries")
-                .select(ITINERARY_LIST_COLS)
-                .eq("is_public", True)
-                .neq("user_id", user_id)
-                .order("created_at", desc=True)
-                .limit(limit)
-                .execute
-            )
+            def _fetch_public():
+                return (
+                    self.client.table("user_itineraries")
+                    .select(ITINERARY_LIST_COLS)
+                    .eq("is_public", True)
+                    .neq("user_id", user_id)
+                    .order("created_at", desc=True)
+                    .limit(limit)
+                    .execute()
+                )
+
+            public_result = await asyncio.to_thread(_fetch_public)
             public_data = public_result.data or []
             for row in public_data:
                 row["is_owner"] = False
@@ -310,13 +449,16 @@ class SupabaseService:
     ) -> Optional[dict]:
         """Update itinerary. Hanya bisa dilakukan oleh pemilik."""
         try:
-            result = await asyncio.to_thread(
-                self.client.table("user_itineraries")
-                .update(update_data)
-                .eq("id", itinerary_id)
-                .eq("user_id", user_id)  # Security check
-                .execute
-            )
+            def _fetch():
+                return (
+                    self.client.table("user_itineraries")
+                    .update(update_data)
+                    .eq("id", itinerary_id)
+                    .eq("user_id", user_id)
+                    .execute()
+                )
+
+            result = await asyncio.to_thread(_fetch)
             return result.data[0] if result.data else None
 
         except Exception as e:
@@ -339,14 +481,17 @@ class SupabaseService:
         User yang menyalin menjadi pemilik baru salinan.
         """
         try:
-            result = await asyncio.to_thread(
-                self.client.table("user_itineraries")
-                .select("*")
-                .eq("id", itinerary_id)
-                .eq("is_public", True)
-                .maybe_single()
-                .execute
-            )
+            def _fetch_original():
+                return (
+                    self.client.table("user_itineraries")
+                    .select("*")
+                    .eq("id", itinerary_id)
+                    .eq("is_public", True)
+                    .maybe_single()
+                    .execute()
+                )
+
+            result = await asyncio.to_thread(_fetch_original)
             original = result.data
             if not original:
                 return None
@@ -357,11 +502,13 @@ class SupabaseService:
                 "itinerary_data": original.get("itinerary_data", {}),
                 "total_budget_idr": original.get("total_budget_idr", 0),
                 "days_count": original.get("days_count", 0),
-                "is_public": False,  # Salinan selalu privat
+                "is_public": False,
             }
-            copy_result = await asyncio.to_thread(
-                self.client.table("user_itineraries").insert(new_data).execute
-            )
+
+            def _fetch_insert():
+                return self.client.table("user_itineraries").insert(new_data).execute()
+
+            copy_result = await asyncio.to_thread(_fetch_insert)
             return copy_result.data[0] if copy_result.data else None
 
         except Exception as e:
@@ -371,17 +518,90 @@ class SupabaseService:
     async def delete_itinerary(self, itinerary_id: str, user_id: str) -> bool:
         """Menghapus itinerary. Hanya pemilik yang bisa menghapus."""
         try:
-            result = await asyncio.to_thread(
-                self.client.table("user_itineraries")
-                .delete()
-                .eq("id", itinerary_id)
-                .eq("user_id", user_id)
-                .execute
-            )
+            def _fetch():
+                return (
+                    self.client.table("user_itineraries")
+                    .delete()
+                    .eq("id", itinerary_id)
+                    .eq("user_id", user_id)
+                    .execute()
+                )
+
+            result = await asyncio.to_thread(_fetch)
             return bool(result.data)
         except Exception as e:
             logger.error(f"delete_itinerary error: {e}")
             return False
+
+    # =========================================================================
+    # CHAT SESSION & HISTORY
+    # =========================================================================
+
+    async def get_or_create_chat_session(self, user_id: str, session_id: Optional[str] = None) -> str:
+        """Mendapatkan ID sesi chat yang ada, atau membuat sesi baru jika belum ada."""
+        if session_id:
+            try:
+                def _fetch():
+                    return (
+                        self.client.table("chat_sessions")
+                        .select("id")
+                        .eq("id", session_id)
+                        .eq("user_id", user_id)
+                        .maybe_single()
+                        .execute()
+                    )
+
+                result = await asyncio.to_thread(_fetch)
+                if result.data:
+                    return session_id
+            except Exception as e:
+                logger.warning(f"Gagal verifikasi session {session_id}: {e}")
+
+        new_session = {
+            "user_id": user_id,
+            "title": "Percakapan Baru",
+        }
+
+        def _fetch():
+            return self.client.table("chat_sessions").insert(new_session).execute()
+
+        result = await asyncio.to_thread(_fetch)
+        return result.data[0]["id"]
+
+    async def get_chat_history(self, session_id: str) -> list[dict]:
+        """Mengambil riwayat obrolan masa lalu dari database."""
+        def _fetch():
+            return (
+                self.client.table("chat_messages")
+                .select("role, content")
+                .eq("session_id", session_id)
+                .order("created_at", desc=False)
+                .execute()
+            )
+
+        result = await asyncio.to_thread(_fetch)
+        return result.data or []
+
+    async def save_chat_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        itinerary_data: dict = None,
+    ):
+        """Menyimpan satu balon pesan (dari user atau dari AI) ke database."""
+        data = {
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+        }
+        if itinerary_data:
+            data["itinerary"] = itinerary_data
+
+        def _fetch():
+            return self.client.table("chat_messages").insert(data).execute()
+
+        await asyncio.to_thread(_fetch)
 
 
 supabase_service = SupabaseService()

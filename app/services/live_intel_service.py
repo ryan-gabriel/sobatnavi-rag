@@ -1,6 +1,11 @@
 import httpx
 from app.core.config import settings
 from app.core.resilience import retry_with_backoff
+import logging
+import os
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
 
 class LiveIntelService:
     @retry_with_backoff(retries=2)
@@ -22,17 +27,23 @@ class LiveIntelService:
     @retry_with_backoff(retries=2)
     async def search_tavily(self, query: str) -> str:
         """Berita/event real-time dari Tavily."""
-        url = "https://api.tavily.com/search"
-        payload = {
-            "api_key": settings.tavily_api_key,
-            "query": query,
-            "search_depth": "basic",
-            "max_results": 2
-        }
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            return "\n".join([f"- {res['content']}" for res in data.get('results', [])])
+        if not settings.tavily_api_key:
+            return "(Live intel tidak tersedia — Tavily API key belum dikonfigurasi)"
+        try:
+            url = "https://api.tavily.com/search"
+            payload = {
+                "api_key": settings.tavily_api_key,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": 2
+            }
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                return "\n".join([f"- {res['content']}" for res in data.get('results', [])])
+        except Exception as e:
+            logger.warning(f"Tavily search gagal: {e}")
+            return "(Live intel tidak tersedia saat ini)"
 
 live_intel_service = LiveIntelService()

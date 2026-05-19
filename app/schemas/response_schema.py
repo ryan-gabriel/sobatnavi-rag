@@ -163,45 +163,35 @@ def _coerce_category(value: Any) -> str:
 
 class RouteSegment(BaseModel):
     """
-    Data rute satu segmen perjalanan antar dua titik (hasil dari calculate_batch_routes).
-    Ambil dari field `segments[i]` hasil pemanggilan tool calculate_batch_routes.
-    Sisipkan ke field `route_to_next` milik PlaceItem yang bersangkutan.
+    Data rute satu segmen perjalanan antar dua titik.
+    Field ini DIISI OTOMATIS oleh backend Python — JANGAN DIISI OLEH AI.
+    AI wajib membiarkan route_to_next = null di setiap PlaceItem.
     """
 
     distance_km: Optional[float] = Field(
         default=None,
-        description=(
-            "Jarak segmen dalam kilometer. "
-            "Ambil dari segments[i].distance_km hasil calculate_batch_routes."
-        ),
+        description="Jarak segmen dalam kilometer. Diisi otomatis oleh backend.",
     )
     travel_time_mins: Optional[int] = Field(
         default=None,
-        description=(
-            "Estimasi waktu perjalanan dalam menit (sudah memperhitungkan kondisi lalu lintas). "
-            "Ambil dari segments[i].travel_time_mins hasil calculate_batch_routes."
-        ),
+        description="Estimasi waktu perjalanan dalam menit. Diisi otomatis oleh backend.",
     )
     traffic_delay_mins: Optional[int] = Field(
         default=None,
-        description=(
-            "Tambahan waktu akibat kemacetan dalam menit. "
-            "Ambil dari segments[i].traffic_delay_mins. Bisa 0 jika tidak ada kemacetan."
-        ),
+        description="Tambahan waktu akibat kemacetan dalam menit. Diisi otomatis oleh backend.",
     )
     polyline: Optional[List[Dict]] = Field(
         default=None,
         description=(
-            "Daftar titik koordinat rute dalam format [{\"lat\": float, \"lng\": float}, ...]. "
-            "Digunakan oleh frontend untuk menggambar jalur di peta. "
-            "Ambil dari segments[i].polyline hasil calculate_batch_routes."
+            "Daftar titik koordinat rute [{\"lat\": float, \"lng\": float}, ...]. "
+            "Digunakan frontend untuk menggambar jalur di peta. Diisi otomatis oleh backend."
         ),
     )
     status: Optional[str] = Field(
         default=None,
         description=(
-            "'OK' jika data langsung dari TomTom API. "
-            "'DEGRADED (Estimasi Haversine)' jika TomTom API gagal dan sistem pakai fallback jarak lurus."
+            "'OK' jika data dari TomTom API. "
+            "'DEGRADED (Estimasi Haversine)' jika TomTom gagal dan pakai fallback."
         ),
     )
 
@@ -228,7 +218,7 @@ class PlaceItem(BaseModel):
             "Ambil dari field `place_id` hasil tool. JANGAN dikarang atau ditebak."
         ),
     )
-    poi_id: Optional[int] = Field(
+    poi_id: Optional[str] = Field(
         default=None,
         description=(
             "ID integer dari tabel poi_attractions di Supabase. "
@@ -378,14 +368,9 @@ class PlaceItem(BaseModel):
     route_to_next: Optional[RouteSegment] = Field(
         default=None,
         description=(
-            "Data rute dari tempat INI ke tempat BERIKUTNYA dalam urutan jadwal hari itu. "
-            "WAJIB diisi dari hasil calculate_batch_routes — ambil dari segments[i] "
-            "di mana i adalah indeks urutan tempat ini dalam array waypoints. "
-            "Contoh: PlaceItem pertama (POI1) → route_to_next = segments[0] (rute hotel→POI1... "
-            "atau lebih tepatnya POI1→POI2). "
-            "PlaceItem TERAKHIR dalam satu hari (biasanya restoran malam/POI terakhir) → "
-            "route_to_next = segmen rute kembali ke hotel. "
-            "JANGAN biarkan null jika calculate_batch_routes sudah berhasil dipanggil."
+            "Data rute dari tempat INI ke tempat berikutnya (atau kembali ke hotel untuk tempat terakhir). "
+            "SELALU null dari AI — field ini DIISI OTOMATIS oleh backend Python setelah AI mengembalikan JSON. "
+            "AI DILARANG KERAS mengisi field ini."
         ),
     )
 
@@ -584,15 +569,14 @@ class BudgetBreakdown(BaseModel):
 
 class DailyItinerary(BaseModel):
     """
-    Jadwal satu hari perjalanan lengkap beserta semua tempat dan data rute.
+    Jadwal satu hari perjalanan lengkap beserta semua tempat.
 
-    ATURAN WAJIB:
-    - `places` HARUS berisi minimal 2 attraction DAN minimal 1 restaurant per hari.
+    ATURAN WAJIB UNTUK AI:
+    - `places` HARUS berisi minimal 3 attraction DAN minimal 1 restaurant per hari.
     - Urutan `places` harus logis secara geografis untuk meminimalkan backtracking.
-    - `route_to_next` di setiap PlaceItem WAJIB diisi dari hasil calculate_batch_routes.
     - Hotel base (base_hotel) TIDAK MASUK ke dalam `places`.
-    - Setiap hari WAJIB memanggil calculate_batch_routes satu kali untuk mengisi
-      day_total_distance_km, day_total_travel_time_mins, dan day_full_polyline.
+    - Field route_to_next, day_total_distance_km, day_total_travel_time_mins, day_full_polyline
+      HARUS selalu null — backend Python mengisi semua ini secara otomatis.
     """
 
     day: int = Field(
@@ -623,33 +607,30 @@ class DailyItinerary(BaseModel):
         description=(
             "Daftar tempat yang dikunjungi hari ini, berurutan sesuai jadwal. "
             "ATURAN URUTAN: Susun searah/berdekatan secara geografis untuk minimasi backtracking. "
-            "Umum: POI pagi (attraction) → attraction siang → restaurant makan siang → "
+            "Umum: attraction pagi → attraction siang → restaurant makan siang → "
             "attraction sore → restaurant makan malam. "
-            "WAJIB: minimal 2 attraction + minimal 1 restaurant per hari. "
-            "WAJIB: setiap PlaceItem punya route_to_next terisi dari calculate_batch_routes. "
+            "WAJIB: minimal 3 attraction + minimal 1 restaurant per hari. "
+            "WAJIB: route_to_next di setiap PlaceItem HARUS null — backend mengisi otomatis. "
             "DILARANG: memasukkan hotel base ke dalam list ini."
         ),
     )
     day_total_distance_km: Optional[float] = Field(
         default=None,
-        description=(
-            "Total jarak berkendara hari ini dalam km. "
-            "Ambil dari field `total_distance_km` hasil calculate_batch_routes untuk hari ini."
-        ),
+        description="Total jarak berkendara hari ini dalam km. DIISI OTOMATIS oleh backend — selalu null dari AI.",
     )
     day_total_travel_time_mins: Optional[int] = Field(
         default=None,
-        description=(
-            "Total waktu berkendara hari ini dalam menit (tidak termasuk waktu di destinasi). "
-            "Ambil dari field `total_travel_time_mins` hasil calculate_batch_routes untuk hari ini."
-        ),
+        description="Total waktu berkendara hari ini dalam menit. DIISI OTOMATIS oleh backend — selalu null dari AI.",
     )
     day_full_polyline: Optional[List[Dict]] = Field(
         default=None,
+        description="Titik koordinat rute hari ini [{\"lat\": float, \"lng\": float}, ...]. DIISI OTOMATIS oleh backend — selalu null dari AI.",
+    )
+    route_from_hotel: Optional[RouteSegment] = Field(
+        default=None,
         description=(
-            "Gabungan semua titik koordinat rute hari ini untuk render jalur di peta. "
-            "Format: [{\"lat\": float, \"lng\": float}, ...]. "
-            "Ambil dari field `full_day_polyline` hasil calculate_batch_routes untuk hari ini."
+            "Rute keberangkatan dari hotel menuju tempat pertama hari ini (segments[0]). "
+            "DIISI OTOMATIS oleh backend — selalu null dari AI."
         ),
     )
     odalan_warning: Optional[str] = Field(
@@ -684,7 +665,7 @@ class RecommendationItem(BaseModel):
         default=None,
         description="Google Place ID. Ambil dari hasil tool. JANGAN dikarang.",
     )
-    poi_id: Optional[int] = Field(
+    poi_id: Optional[str] = Field(
         default=None,
         description="ID integer dari database. Ambil dari field `id` hasil tool.",
     )
@@ -919,6 +900,9 @@ class FinalAIResponse(BaseModel):
             "Contoh: 5750000 untuk total Rp 5.750.000."
         ),
     )
+
+    session_id: Optional[str] = Field(None, description="ID sesi aktif (dikembalikan ke frontend untuk multi-turn)")
+    itinerary_id: Optional[str] = Field(None, description="ID itinerary yang disimpan (populated setelah save)")
 
     budget_breakdown: Optional[BudgetBreakdown] = Field(
         default=None,

@@ -1,4 +1,5 @@
 # app/engine/recommender.py
+from app.services.tomtom_service import _haversine_km
 import numpy as np
 from sklearn.cluster import DBSCAN
 import logging
@@ -6,11 +7,9 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-# =====================================================================
 # KONFIGURASI TOPSIS PER KATEGORI
 # Setiap kategori memiliki daftar fitur, bobot (weights), dan dampak
 # (impacts: 1 = benefit/makin tinggi makin baik, -1 = cost/makin rendah makin baik)
-# =====================================================================
 TOPSIS_CONFIG = {
     "poi": {
         "features": ["rating", "popularity", "price_value", "strategic_score", "visual_interest_index"],
@@ -191,7 +190,8 @@ def cluster_and_rank_pois(
     num_clusters: int = 1,
     top_n_per_cluster: int = 3,
     category: Literal["poi", "hotel", "restaurant"] = "poi",
-    dbscan_radius_km: float = 15.0,
+    dbscan_radius_km: float = None,
+    preference_mode: str = "standard",
 ) -> list:
     """
     Mengelompokkan POI secara spasial (DBSCAN) dan memilih yang terbaik
@@ -207,17 +207,46 @@ def cluster_and_rank_pois(
     Returns:
         List tempat terbaik yang sudah diurutkan per cluster
     """
+    if dbscan_radius_km is None:
+        # Estimate radius from coordinate spread
+        if len(pois) > 1:
+            lats = [p["latitude"] for p in pois if p.get("latitude")]
+            lons = [p["longitude"] for p in pois if p.get("longitude")]
+            spread_km = _haversine_km(min(lats), min(lons), max(lats), max(lons))
+            dbscan_radius_km = max(3.0, spread_km / (num_clusters * 1.5))
+        else:
+            dbscan_radius_km = 5.0
+
     if not pois:
         return []
 
     config = TOPSIS_CONFIG.get(category, TOPSIS_CONFIG["poi"])
+
+    import copy
+    config = copy.deepcopy(config) 
+
+    feature_keys = config["features"]
+
+    if preference_mode == "hidden_gem" and "popularity" in feature_keys:
+        idx = feature_keys.index("popularity")
+        config["impacts"][idx] = -1
+        config["weights"][idx] = 0.25
+
+    elif preference_mode == "luxury" and "price_value" in feature_keys:
+        idx = feature_keys.index("price_value")
+        config["impacts"][idx] = -1
+
+    elif preference_mode == "budget" and "price_value" in feature_keys:
+        idx = feature_keys.index("price_value")
+        config["weights"][idx] = 0.35
+
     feature_keys = config["features"]
     weights = np.array(config["weights"])
     impacts = np.array(config["impacts"])
 
-    # =====================================================================
+
     # 1. Ekstraksi Fitur & Filter Validitas
-    # =====================================================================
+
     coords, feature_matrix_rows, valid_pois = [], [], []
 
     for p in pois:
@@ -242,9 +271,9 @@ def cluster_and_rank_pois(
         logger.warning("Tidak ada POI dengan koordinat valid. Return raw pois[:limit].")
         return pois[: top_n_per_cluster * num_clusters]
 
-    # =====================================================================
+
     # 2. TOPSIS Scoring (hitung sebelum clustering agar bisa fallback)
-    # =====================================================================
+
     data_matrix = np.array(feature_matrix_rows, dtype=float)
 
     try:
@@ -257,18 +286,18 @@ def cluster_and_rank_pois(
         p["topsis_score"] = round(float(scores[i]), 4)
         p["topsis_category"] = category
 
-    # =====================================================================
+
     # 3. Clustering Spasial (DBSCAN Haversine)
-    # =====================================================================
+
     coords_rad = np.radians(coords)
     eps_rad = dbscan_radius_km / 6371.0  # Konversi km ke radian (radius bumi 6371 km)
 
-    dbscan = DBSCAN(eps=eps_rad, min_samples=2, algorithm="ball_tree", metric="haversine")
+    dbscan = DBSCAN(eps=eps_rad, min_samples=1, algorithm="ball_tree", metric="haversine")
     cluster_labels = dbscan.fit_predict(coords_rad)
 
-    # =====================================================================
+
     # 4. Grouping & Fallback
-    # =====================================================================
+
     clustered_result: dict[int, list] = {}
     outliers = []
 
@@ -298,9 +327,9 @@ def cluster_and_rank_pois(
         valid_pois_sorted = sorted(valid_pois, key=lambda x: x.get("topsis_score", 0), reverse=True)
         return valid_pois_sorted[: top_n_per_cluster * num_clusters]
 
-    # =====================================================================
+
     # 5. Pilih Top-N Cluster Berdasarkan Skor TOPSIS Rata-rata
-    # =====================================================================
+
     cluster_scores = []
     for c_id, group in clustered_result.items():
         avg_score = sum(p.get("topsis_score", 0) for p in group) / len(group)
@@ -310,9 +339,9 @@ def cluster_and_rank_pois(
     cluster_scores.sort(key=lambda x: x[0], reverse=True)
     best_cluster_ids = [c_id for _, c_id in cluster_scores[:num_clusters]]
 
-    # =====================================================================
+
     # 6. Ambil Top-N per Cluster
-    # =====================================================================
+
     final_list = []
     for c_id in best_cluster_ids:
         sorted_group = sorted(

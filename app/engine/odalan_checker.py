@@ -3,11 +3,11 @@ from typing import List, Optional
 
 class OdalanCheckResult(BaseModel):
     status: str  # "CLEAR", "AFFECTED" (macet/ramai), "BLOCKED" (tutup)
-    poi_id: Optional[int] = None
+    poi_id: Optional[str] = None
     poi_name: Optional[str] = None
     message: str
 
-def evaluate_odalan_status(poi_id: int, active_odalans: List[dict]) -> OdalanCheckResult:
+def evaluate_odalan_status(poi_id: str, active_odalans: list[dict]) -> OdalanCheckResult:
     """Mengecek status spesifik sebuah POI apakah terblokir Odalan."""
     for odalan in active_odalans:
         if odalan.get("poi_attraction_id") == poi_id:
