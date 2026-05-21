@@ -1572,6 +1572,18 @@ async def delete_itinerary(
 
 
 # ============================================================
+# CHAT MESSAGES ENDPOINT
+# ============================================================
+
+@app.get("/api/chat/sessions/{session_id}/messages", tags=["AI Chat"])
+async def get_chat_messages(session_id: str):
+    history = await supabase_service.get_chat_history(session_id)
+    if not history:
+        return []
+    return history
+
+
+# ============================================================
 # PLACE SEARCH ENDPOINTS
 # ============================================================
 
@@ -1603,15 +1615,9 @@ async def get_place_recommendations(
     limit: int = Query(10, ge=1, le=30),
     current_user=Depends(get_current_user),
 ):
-    try:
-        raw = await supabase_service.search_pois_semantic(query=query.strip(), limit=limit * 2)
-        ranked = cluster_and_rank_pois(raw, num_clusters=1, top_n_per_cluster=limit, category=category)
-        return {"results": ranked, "count": len(ranked), "query": query}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"place_recommendations error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Gagal mengambil rekomendasi tempat.")
+    raw = await supabase_service.search_pois_semantic(query=query, limit=limit * 2)
+    ranked = cluster_and_rank_pois(raw, num_clusters=1, top_n_per_cluster=limit, category=category)
+    return {"results": ranked, "count": len(ranked), "query": query}
 
 
 # ============================================================
