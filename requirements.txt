@@ -14,3 +14,7 @@ python-dotenv>=1.1.0
 # Utilities
 numpy>=2.2.5
 scikit-learn>=1.6.1
+
+# Rate Limiting & Security
+slowapi>=0.1.9
+limits>=3.6.0

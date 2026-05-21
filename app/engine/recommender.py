@@ -7,6 +7,28 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BALI GEOGRAPHIC CONSTRAINTS
+# ─────────────────────────────────────────────────────────────────────────────
+# Bali island bounding box (slightly expanded to include Nusa Penida etc.)
+BALI_BBOX = {
+    "lat_min": -8.90,
+    "lat_max": -8.05,
+    "lng_min": 114.35,
+    "lng_max": 115.75,
+}
+
+# Maximum DBSCAN cluster radius (km).  A single day-trip cluster should never
+# exceed this — it corresponds to ~40 min driving at Bali traffic speeds.
+MAX_CLUSTER_RADIUS_KM = {
+    "poi":        20.0,   # Attractions: tight, 1-day area
+    "restaurant": 20.0,   # Restaurants: injected near attraction centroid anyway
+    "hotel":      25.0,   # Hotels: slight slack — might be a hub for 2+ days
+}
+
+# Any individual POI further than this from its cluster centroid is ejected.
+MAX_POI_DISTANCE_FROM_CENTROID_KM = 20.0
+
 # KONFIGURASI TOPSIS PER KATEGORI
 # Setiap kategori memiliki daftar fitur, bobot (weights), dan dampak
 # (impacts: 1 = benefit/makin tinggi makin baik, -1 = cost/makin rendah makin baik)
@@ -185,6 +207,26 @@ def topsis_score(data_matrix: np.ndarray, weights: np.ndarray, impacts: np.ndarr
     return scores
 
 
+def _filter_bali_bbox(pois: list) -> list:
+    """
+    Drop any POI whose coordinates fall outside Bali's bounding box.
+    This removes stray data points that would skew the DBSCAN radius calculation.
+    """
+    filtered = [
+        p for p in pois
+        if (
+            p.get("latitude") is not None
+            and p.get("longitude") is not None
+            and BALI_BBOX["lat_min"] <= p["latitude"] <= BALI_BBOX["lat_max"]
+            and BALI_BBOX["lng_min"] <= p["longitude"] <= BALI_BBOX["lng_max"]
+        )
+    ]
+    removed = len(pois) - len(filtered)
+    if removed > 0:
+        logger.warning(f"_filter_bali_bbox: removed {removed} POIs outside Bali bbox.")
+    return filtered
+
+
 def cluster_and_rank_pois(
     pois: list,
     num_clusters: int = 1,
@@ -202,23 +244,37 @@ def cluster_and_rank_pois(
         num_clusters: Jumlah cluster (= jumlah hari perjalanan)
         top_n_per_cluster: Tempat terbaik yang dipilih per cluster
         category: 'poi', 'hotel', atau 'restaurant' — menentukan bobot TOPSIS
-        dbscan_radius_km: Radius DBSCAN dalam km (default 15km)
+        dbscan_radius_km: Radius DBSCAN dalam km. If None, auto-calculated with a
+                          hard cap of MAX_CLUSTER_RADIUS_KM[category].
     
     Returns:
         List tempat terbaik yang sudah diurutkan per cluster
     """
+    # ── Step 0: Bali bbox pre-filter ─────────────────────────────────────────
+    pois = _filter_bali_bbox(pois)
+
+    if not pois:
+        return []
+
+    # ── Step 1: Determine DBSCAN radius ──────────────────────────────────────
+    max_radius = MAX_CLUSTER_RADIUS_KM.get(category, 20.0)
+
     if dbscan_radius_km is None:
-        # Estimate radius from coordinate spread
         if len(pois) > 1:
             lats = [p["latitude"] for p in pois if p.get("latitude")]
             lons = [p["longitude"] for p in pois if p.get("longitude")]
             spread_km = _haversine_km(min(lats), min(lons), max(lats), max(lons))
-            dbscan_radius_km = max(3.0, spread_km / (num_clusters * 1.5))
+            # Dynamic formula but hard-capped: never allow a cluster to span more
+            # than MAX_CLUSTER_RADIUS_KM — otherwise distant corners of Bali can
+            # end up in the same cluster and produce 80+ km day itineraries.
+            dynamic = spread_km / (num_clusters * 1.5)
+            dbscan_radius_km = min(max(3.0, dynamic), max_radius)
         else:
             dbscan_radius_km = 5.0
 
-    if not pois:
-        return []
+    # Always enforce the hard cap even when caller passes a value explicitly.
+    dbscan_radius_km = min(dbscan_radius_km, max_radius)
+    logger.info(f"cluster_and_rank_pois [{category}]: DBSCAN radius = {dbscan_radius_km:.1f} km")
 
     config = TOPSIS_CONFIG.get(category, TOPSIS_CONFIG["poi"])
 
@@ -309,10 +365,11 @@ def cluster_and_rank_pois(
             p["cluster_id"] = c_id
             clustered_result.setdefault(c_id, []).append(p)
 
-    # Fallback 1: Semua outlier → coba dengan radius lebih besar (25km)
+    # Fallback 1: Semua outlier → coba dengan radius lebih besar (capped)
     if not clustered_result and outliers:
-        logger.warning("DBSCAN: Semua titik adalah outlier. Mencoba radius 25km...")
-        eps_fallback = 25.0 / 6371.0
+        fallback_r = min(max_radius, dbscan_radius_km * 1.5)
+        logger.warning(f"DBSCAN: Semua titik adalah outlier. Mencoba radius {fallback_r:.1f}km...")
+        eps_fallback = fallback_r / 6371.0
         dbscan_fallback = DBSCAN(eps=eps_fallback, min_samples=1, algorithm="ball_tree", metric="haversine")
         labels_fallback = dbscan_fallback.fit_predict(coords_rad)
         for i, p in enumerate(valid_pois):
@@ -328,8 +385,47 @@ def cluster_and_rank_pois(
         return valid_pois_sorted[: top_n_per_cluster * num_clusters]
 
 
-    # 5. Pilih Top-N Cluster Berdasarkan Skor TOPSIS Rata-rata
+    # ── Step 5: Iterative centroid distance filter ────────────────────────────
+    # DBSCAN with a radius cap can still produce elongated "chain" clusters
+    # (A→B→C each within 20km of the next, but A and C are 40km apart).
+    # We run the centroid filter up to MAX_ITER times: each pass recomputes the
+    # centroid from the surviving points and ejects any point > threshold away.
+    # Iteration stops when no more points are ejected (convergence).
+    MAX_CENTROID_ITER = 3
+    for _pass in range(MAX_CENTROID_ITER):
+        filtered_clusters: dict[int, list] = {}
+        total_ejected_this_pass = 0
 
+        for c_id, group in clustered_result.items():
+            if len(group) <= 1:
+                filtered_clusters[c_id] = group
+                continue
+
+            c_lats = [p["latitude"] for p in group if p.get("latitude")]
+            c_lons = [p["longitude"] for p in group if p.get("longitude")]
+            centroid_lat = sum(c_lats) / len(c_lats)
+            centroid_lon = sum(c_lons) / len(c_lons)
+
+            kept = [
+                p for p in group
+                if p.get("latitude") and p.get("longitude")
+                and _haversine_km(p["latitude"], p["longitude"], centroid_lat, centroid_lon)
+                <= MAX_POI_DISTANCE_FROM_CENTROID_KM
+            ]
+            if not kept:
+                kept = group  # Safety: never empty a cluster entirely
+            total_ejected_this_pass += len(group) - len(kept)
+            filtered_clusters[c_id] = kept
+
+        clustered_result = filtered_clusters
+        if total_ejected_this_pass == 0:
+            break  # Converged
+        logger.info(
+            f"cluster_and_rank_pois [{category}]: centroid pass {_pass+1} "
+            f"ejected {total_ejected_this_pass} far POIs"
+        )
+
+    # ── Step 6: Pick top-N clusters by average TOPSIS score ───────────────────
     cluster_scores = []
     for c_id, group in clustered_result.items():
         avg_score = sum(p.get("topsis_score", 0) for p in group) / len(group)
@@ -340,8 +436,7 @@ def cluster_and_rank_pois(
     best_cluster_ids = [c_id for _, c_id in cluster_scores[:num_clusters]]
 
 
-    # 6. Ambil Top-N per Cluster
-
+    # ── Step 7: Take top-N per cluster ───────────────────────────────────────
     final_list = []
     for c_id in best_cluster_ids:
         sorted_group = sorted(
@@ -353,6 +448,7 @@ def cluster_and_rank_pois(
 
     logger.info(
         f"cluster_and_rank_pois [{category}]: {len(pois)} raw → "
-        f"{len(final_list)} terpilih dari {len(clustered_result)} cluster"
+        f"{len(final_list)} selected from {len(clustered_result)} clusters "
+        f"(radius={dbscan_radius_km:.1f} km)"
     )
     return final_list

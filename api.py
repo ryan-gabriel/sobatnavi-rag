@@ -17,9 +17,16 @@ import os
 import json
 import logging
 import math
-from fastapi import FastAPI, HTTPException, Depends, Security, Query
+import uuid
+from fastapi import FastAPI, HTTPException, Depends, Security, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from starlette.middleware.base import BaseHTTPMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from typing import List, Dict, Optional, Literal
@@ -32,16 +39,72 @@ from app.services.live_intel_service import live_intel_service
 from app.engine.odalan_checker import extract_global_avoid_zones
 from app.engine.recommender import cluster_and_rank_pois
 from app.core.config import settings
+from app.core.rate_limiter import (
+    limiter,
+    RATE_CHAT,
+    RATE_ITINERARY_WRITE,
+    RATE_ITINERARY_READ,
+    RATE_SEARCH,
+    RATE_HEALTH,
+)
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# SECURITY HEADERS MIDDLEWARE
+# ============================================================
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Injects security-related HTTP response headers on every response."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        return response
+
+
+# ============================================================
+# FASTAPI APP + MIDDLEWARE STACK
+# ============================================================
+
 app = FastAPI(
     title="SobatNavi AI Agent API",
     version="8.0",
     description="AI Travel Assistant API untuk Bali — Heidi",
+    # Do not expose internal server errors in the OpenAPI /docs error examples
+    docs_url="/docs" if os.getenv("ENVIRONMENT", "production") != "production" else None,
+    redoc_url=None,
 )
+
+# Attach slowapi limiter to the app state and register the 429 handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# TrustedHost — reject requests with unexpected Host headers (reverse-proxy safety)
+_allowed_hosts = settings.allowed_hosts_list
+if _allowed_hosts and _allowed_hosts != ["*"]:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
+
+# CORS — restrict cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins_list,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
+    max_age=600,
+)
+
+# Security headers on every response
+app.add_middleware(SecurityHeadersMiddleware)
 
 if not settings.openai_api_key:
     logger.warning(
@@ -107,18 +170,40 @@ async def get_optional_user(
 # ============================================================
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., description="Pesan user ke Heidi")
+    # message capped at 4000 chars to prevent prompt injection and token abuse
+    message: str = Field(..., description="Pesan user ke Heidi", max_length=4000)
     mode: Literal["general", "deep_research"] = Field("general")
-    session_id: Optional[str] = Field(None)
-    history: Optional[List[Dict]] = Field(default_factory=list)
+    budget_preference: Literal["budget", "moderate", "luxury"] = Field(
+        "moderate",
+        description="Preferensi anggaran perjalanan: 'budget' (hemat), 'moderate' (menengah), 'luxury' (mewah)."
+    )
+    session_id: Optional[str] = Field(None, max_length=128)
+    # history capped at 50 items to prevent memory/token exhaustion
+    history: Optional[List[Dict]] = Field(default_factory=list, max_length=50)
     current_itinerary: Optional[Dict] = Field(None)
-    itinerary_id: Optional[str] = Field(None)
+    itinerary_id: Optional[str] = Field(None, max_length=128)
+
+    @field_validator("message")
+    @classmethod
+    def message_not_empty(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("Pesan tidak boleh kosong.")
+        return stripped
+
+    @field_validator("history", mode="before")
+    @classmethod
+    def history_max_items(cls, v):
+        if v and len(v) > 50:
+            # Silently truncate to the last 50 messages (keep recent context)
+            return v[-50:]
+        return v
 
 
 class UpdateItineraryRequest(BaseModel):
-    title: Optional[str] = Field(None)
+    title: Optional[str] = Field(None, max_length=200)
     itinerary_data: Dict = Field(...)
-    total_budget_idr: Optional[int] = Field(None)
+    total_budget_idr: Optional[int] = Field(None, ge=0)
     is_public: Optional[bool] = Field(None)
 
 
@@ -518,10 +603,19 @@ def build_heidi_prompt(
     is_editing: bool,
     current_itinerary: Optional[Dict],
     poi_budget: dict,
+    preference_mode: str = "standard",
 ) -> str:
     schema_string = json.dumps(FinalAIResponse.model_json_schema(), indent=2)
     today_str = datetime.now().strftime("%Y-%m-%d")
     tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Map preference_mode ke label yang mudah dibaca
+    _budget_label_map = {
+        "budget": "Hemat (budget) — prioritaskan tempat terjangkau & value for money",
+        "luxury": "Mewah (luxury) — prioritaskan tempat premium & eksklusif",
+        "standard": "Menengah (moderate) — keseimbangan harga dan kualitas",
+    }
+    _budget_label = _budget_label_map.get(preference_mode, _budget_label_map["standard"])
 
     # Informasikan AI tentang POI budget yang sudah dikalkulasi backend
     poi_budget_context = f"""
@@ -534,9 +628,11 @@ Backend telah menghitung jumlah POI yang masuk akal berdasarkan pesan user:
   • Atraksi per hari       : {poi_budget.get('attractions_per_day', 4)} tempat wisata
   • Sesi makan per hari    : {poi_budget.get('meals_per_day', 2)} sesi makan (diisi backend, JANGAN kamu isi)
   • Total places per hari  : {poi_budget.get('total_places_per_day', 6)} (atraksi + makan)
+  • Preferensi anggaran    : {_budget_label}
 
 INSTRUKSI TERKAIT:
   ✅ Saat memanggil get_smart_recommendations, gunakan limit_per_day={poi_budget.get('attractions_per_day', 4)}
+  ✅ Saat memanggil get_smart_recommendations, WAJIB sertakan preference_mode="{preference_mode}"
   ✅ JANGAN sertakan restoran/warung makan di dalam array places — backend akan menyisipkannya otomatis
   ✅ Jika user bertanya jumlah tempat dan terasa sedikit, jelaskan bahwa sesi makan sudah disisipkan terpisah
   ✅ Fetch dari DB: backend menggunakan multiplier 3x untuk seleksi TOPSIS yang lebih baik
@@ -649,6 +745,7 @@ async def inject_meals_to_itinerary(
     parsed_data: "FinalAIResponse",
     poi_budget: dict,
     district_hint: str = "Bali",
+    preference_mode: str = "standard",
 ) -> "FinalAIResponse":
     """
     Menyisipkan restoran ke dalam setiap hari itinerary secara programatik.
@@ -711,7 +808,11 @@ async def inject_meals_to_itinerary(
         # Fallback: semantic search jika nearby tidak cukup
         if len(restaurants_found) < meals_per_day:
             try:
-                semantic_query = f"restoran {district_hint} Bali"
+                _restaurant_query_map = {
+                    "budget": f"warung makan murah {district_hint} Bali harga terjangkau",
+                    "luxury": f"restoran fine dining mewah {district_hint} Bali premium",
+                }
+                semantic_query = _restaurant_query_map.get(preference_mode, f"restoran {district_hint} Bali")
                 semantic_restaurants = await supabase_service.search_amenities_semantic(
                     query=semantic_query,
                     amenity_type="restaurant",
@@ -1027,7 +1128,9 @@ def sanitize_ai_output(raw_dict: dict) -> dict:
 # ============================================================
 
 @app.post("/api/chat", response_model=FinalAIResponse, tags=["AI Chat"])
+@limiter.limit(RATE_CHAT)
 async def chat_with_heidi(
+    request: Request,
     req: ChatRequest,
     current_user=Depends(get_optional_user),
 ):
@@ -1047,6 +1150,10 @@ async def chat_with_heidi(
         user_id = current_user.id if is_authenticated else None
         is_editing = req.current_itinerary is not None
 
+        # Expose user_id to the rate limiter key function via request state
+        if user_id:
+            request.state.user_id = str(user_id)
+
         # --- KALKULASI POI BUDGET (PRE-AI) ---
         trip_params = extract_trip_parameters_from_message(req.message)
         # Deteksi jumlah hari dari history / pesan untuk kalkulasi budget
@@ -1065,8 +1172,12 @@ async def chat_with_heidi(
         )
         logger.info(f"POI Budget kalkulasi: {poi_budget}")
 
+        # --- MAP budget_preference → preference_mode ---
+        _budget_to_mode = {"budget": "budget", "moderate": "standard", "luxury": "luxury"}
+        preference_mode = _budget_to_mode.get(req.budget_preference, "standard")
+
         # --- BUILD SYSTEM PROMPT ---
-        system_prompt = build_heidi_prompt(req.mode, is_editing, req.current_itinerary, poi_budget)
+        system_prompt = build_heidi_prompt(req.mode, is_editing, req.current_itinerary, poi_budget, preference_mode)
         messages = [{"role": "system", "content": system_prompt}]
         active_session_id = None
 
@@ -1091,61 +1202,82 @@ async def chat_with_heidi(
         messages.append({"role": "user", "content": req.message})
 
         # --- TOOL CALLING LOOP ---
+        # Wrapped in a 120-second hard timeout to prevent runaway requests
+        # from holding connections indefinitely.
         MAX_LOOPS = 20
-        loop_count = 0
-        raw_text = ""
+        AI_TIMEOUT_SECONDS = 120
 
-        while loop_count < MAX_LOOPS:
-            loop_count += 1
-            logger.info(f"AI loop {loop_count}/{MAX_LOOPS}")
-            response = await _get_client().chat.completions.create(
-                model=settings.openai_model_id,
-                messages=messages,
-                tools=OPENAI_TOOLS,
-                response_format={"type": "json_object"},
-                temperature=0.1,
-            )
+        async def _run_ai_loop() -> str:
+            loop_count = 0
+            _raw_text = ""
 
-            response_message = response.choices[0].message
+            while loop_count < MAX_LOOPS:
+                loop_count += 1
+                logger.info(f"AI loop {loop_count}/{MAX_LOOPS}")
+                response = await _get_client().chat.completions.create(
+                    model=settings.openai_model_id,
+                    messages=messages,
+                    tools=OPENAI_TOOLS,
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                )
 
-            if response_message.tool_calls:
-                messages.append(response_message.model_dump(exclude_none=True))
-                for tool_call in response_message.tool_calls:
-                    func_name = tool_call.function.name
-                    func_to_call = AVAILABLE_FUNCTIONS.get(func_name)
+                response_message = response.choices[0].message
 
-                    if not func_to_call:
-                        logger.warning(f"Tool tidak dikenal: {func_name}")
+                if response_message.tool_calls:
+                    messages.append(response_message.model_dump(exclude_none=True))
+                    for tool_call in response_message.tool_calls:
+                        func_name = tool_call.function.name
+                        func_to_call = AVAILABLE_FUNCTIONS.get(func_name)
+
+                        if not func_to_call:
+                            logger.warning(f"Tool tidak dikenal: {func_name}")
+                            messages.append({
+                                "tool_call_id": tool_call.id,
+                                "role": "tool",
+                                "name": func_name,
+                                "content": json.dumps({"error": f"Tool '{func_name}' tidak tersedia."})
+                            })
+                            continue
+
+                        try:
+                            func_args = json.loads(tool_call.function.arguments)
+                            logger.info(f"OpenAI panggil: {func_name}({func_args})")
+                            func_result = await func_to_call(**func_args)
+                        except Exception as e:
+                            # Log full detail server-side; return sanitized error to AI
+                            logger.error(f"Error pada {func_name}: {e}", exc_info=True)
+                            func_result = {"error": "Tool execution failed."}
+
                         messages.append({
                             "tool_call_id": tool_call.id,
                             "role": "tool",
                             "name": func_name,
-                            "content": json.dumps({"error": f"Tool '{func_name}' tidak tersedia."})
+                            "content": json.dumps(func_result, default=str)
                         })
-                        continue
+                else:
+                    _raw_text = response_message.content
+                    break
 
-                    try:
-                        func_args = json.loads(tool_call.function.arguments)
-                        logger.info(f"OpenAI panggil: {func_name}({func_args})")
-                        func_result = await func_to_call(**func_args)
-                    except Exception as e:
-                        logger.error(f"Error pada {func_name}: {e}", exc_info=True)
-                        func_result = {"error": str(e)}
+            if loop_count >= MAX_LOOPS and not _raw_text:
+                raise HTTPException(
+                    status_code=504,
+                    detail="Proses AI terlalu lama. Silakan coba lagi."
+                )
+            return _raw_text
 
-                    messages.append({
-                        "tool_call_id": tool_call.id,
-                        "role": "tool",
-                        "name": func_name,
-                        "content": json.dumps(func_result, default=str)
-                    })
-            else:
-                raw_text = response_message.content
-                break
-
-        if loop_count >= MAX_LOOPS and not raw_text:
+        try:
+            raw_text = await asyncio.wait_for(
+                _run_ai_loop(),
+                timeout=AI_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"AI loop timeout setelah {AI_TIMEOUT_SECONDS}s untuk user={user_id}"
+            )
             raise HTTPException(
                 status_code=504,
-                detail=f"Proses AI terlalu lama (melebihi {MAX_LOOPS} iterasi tool calls)."
+                detail="Permintaan AI melebihi batas waktu. Silakan coba lagi."
             )
 
         # --- PARSE & VALIDASI JSON ---
@@ -1169,14 +1301,13 @@ async def chat_with_heidi(
             logger.info(f"District hint terdeteksi: {district_hint}")
 
             # 1. HOTEL GUARANTEE — Pastikan base_hotel selalu ada
-            preference_mode = trip_params.get("pace", "standard")
             parsed_data = await guarantee_base_hotel(parsed_data, district_hint, preference_mode)
 
             # 2. MEAL INJECTION — Sisipkan restoran ke setiap hari
             # Lewati jika mode editing untuk menghindari duplikasi
             if not is_editing:
                 parsed_data = await inject_meals_to_itinerary(
-                    parsed_data, poi_budget, district_hint
+                    parsed_data, poi_budget, district_hint, preference_mode
                 )
 
             # 3. ROUTING INJECTION — Backend hitung rute (tidak berubah dari v7)
@@ -1272,9 +1403,14 @@ async def chat_with_heidi(
 
     except HTTPException:
         raise
+    except asyncio.TimeoutError:
+        # Already handled inside the try block, but caught here as safety net
+        logger.error("asyncio.TimeoutError escaped AI loop.", exc_info=True)
+        raise HTTPException(status_code=504, detail="Permintaan AI melebihi batas waktu.")
     except Exception as e:
+        # Log full detail internally — DO NOT leak internal exception messages to client
         logger.error(f"Chat error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"AI Processing Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Terjadi kesalahan internal. Silakan coba lagi.")
 
 
 # ============================================================
@@ -1282,79 +1418,157 @@ async def chat_with_heidi(
 # ============================================================
 
 @app.get("/api/itineraries", response_model=List[ItinerarySummary], tags=["Itinerary CRUD"])
+@limiter.limit(RATE_ITINERARY_READ)
 async def list_itineraries(
+    request: Request,
     include_public: bool = Query(False),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     current_user=Depends(get_current_user),
 ):
-    data = await supabase_service.list_user_itineraries(
-        user_id=current_user.id,
-        include_public=include_public,
-        limit=limit,
-        offset=offset,
-    )
-    return data
+    try:
+        data = await supabase_service.list_user_itineraries(
+            user_id=current_user.id,
+            include_public=include_public,
+            limit=limit,
+            offset=offset,
+        )
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"list_itineraries error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Gagal mengambil daftar itinerary.")
 
 
 @app.get("/api/itinerary/{itinerary_id}", tags=["Itinerary CRUD"])
-async def get_itinerary(itinerary_id: str, current_user=Depends(get_current_user)):
-    data = await supabase_service.get_itinerary_by_id(itinerary_id, current_user.id)
-    if data is None:
-        raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau kamu tidak memiliki akses.")
-    return data
+@limiter.limit(RATE_ITINERARY_READ)
+async def get_itinerary(
+    request: Request,
+    itinerary_id: str,
+    current_user=Depends(get_current_user),
+):
+    # Validate UUID format to prevent probing with arbitrary strings
+    try:
+        uuid.UUID(itinerary_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Format itinerary ID tidak valid.")
+    try:
+        data = await supabase_service.get_itinerary_by_id(itinerary_id, current_user.id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau kamu tidak memiliki akses.")
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_itinerary error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Gagal mengambil itinerary.")
 
 
 @app.put("/api/itinerary/{itinerary_id}", tags=["Itinerary CRUD"])
+@limiter.limit(RATE_ITINERARY_WRITE)
 async def update_itinerary_manual(
+    request: Request,
     itinerary_id: str,
     body: UpdateItineraryRequest,
     current_user=Depends(get_current_user),
 ):
-    days = body.itinerary_data.get("itinerary_days", [])
-    update_payload = {
-        "itinerary_data": body.itinerary_data,
-        "days_count": len(days),
-    }
-    if body.title is not None:
-        update_payload["title"] = body.title
-    if body.total_budget_idr is not None:
-        update_payload["total_budget_idr"] = body.total_budget_idr
-    if body.is_public is not None:
-        update_payload["is_public"] = body.is_public
+    try:
+        uuid.UUID(itinerary_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Format itinerary ID tidak valid.")
+    try:
+        days = body.itinerary_data.get("itinerary_days", [])
+        update_payload = {
+            "itinerary_data": body.itinerary_data,
+            "days_count": len(days),
+        }
+        if body.title is not None:
+            update_payload["title"] = body.title
+        if body.total_budget_idr is not None:
+            update_payload["total_budget_idr"] = body.total_budget_idr
+        if body.is_public is not None:
+            update_payload["is_public"] = body.is_public
 
-    result = await supabase_service.update_itinerary_full(itinerary_id, current_user.id, update_payload)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau kamu bukan pemiliknya.")
-    return result
+        result = await supabase_service.update_itinerary_full(itinerary_id, current_user.id, update_payload)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau kamu bukan pemiliknya.")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"update_itinerary error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Gagal memperbarui itinerary.")
 
 
 @app.patch("/api/itinerary/{itinerary_id}/visibility", tags=["Itinerary CRUD"])
+@limiter.limit(RATE_ITINERARY_WRITE)
 async def toggle_itinerary_visibility(
+    request: Request,
     itinerary_id: str,
     body: ToggleVisibilityRequest,
     current_user=Depends(get_current_user),
 ):
-    result = await supabase_service.update_itinerary_visibility(itinerary_id, current_user.id, body.is_public)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau kamu bukan pemiliknya.")
-    return {"status": "updated", "itinerary_id": itinerary_id, "is_public": body.is_public}
+    try:
+        uuid.UUID(itinerary_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Format itinerary ID tidak valid.")
+    try:
+        result = await supabase_service.update_itinerary_visibility(itinerary_id, current_user.id, body.is_public)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau kamu bukan pemiliknya.")
+        return {"status": "updated", "itinerary_id": itinerary_id, "is_public": body.is_public}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"toggle_visibility error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Gagal mengubah visibilitas itinerary.")
 
 
 @app.post("/api/itinerary/{itinerary_id}/copy", tags=["Itinerary CRUD"])
-async def copy_public_itinerary(itinerary_id: str, current_user=Depends(get_current_user)):
-    result = await supabase_service.copy_public_itinerary(itinerary_id, current_user.id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau bukan itinerary publik.")
-    return {"status": "copied", "new_itinerary_id": result.get("id"), "title": result.get("title")}
+@limiter.limit(RATE_ITINERARY_WRITE)
+async def copy_public_itinerary(
+    request: Request,
+    itinerary_id: str,
+    current_user=Depends(get_current_user),
+):
+    try:
+        uuid.UUID(itinerary_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Format itinerary ID tidak valid.")
+    try:
+        result = await supabase_service.copy_public_itinerary(itinerary_id, current_user.id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau bukan itinerary publik.")
+        return {"status": "copied", "new_itinerary_id": result.get("id"), "title": result.get("title")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"copy_itinerary error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Gagal menyalin itinerary.")
 
 
 @app.delete("/api/itinerary/{itinerary_id}", tags=["Itinerary CRUD"])
-async def delete_itinerary(itinerary_id: str, current_user=Depends(get_current_user)):
-    success = await supabase_service.delete_itinerary(itinerary_id, current_user.id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau kamu bukan pemiliknya.")
-    return {"status": "deleted", "itinerary_id": itinerary_id}
+@limiter.limit(RATE_ITINERARY_WRITE)
+async def delete_itinerary(
+    request: Request,
+    itinerary_id: str,
+    current_user=Depends(get_current_user),
+):
+    try:
+        uuid.UUID(itinerary_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Format itinerary ID tidak valid.")
+    try:
+        success = await supabase_service.delete_itinerary(itinerary_id, current_user.id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Itinerary tidak ditemukan atau kamu bukan pemiliknya.")
+        return {"status": "deleted", "itinerary_id": itinerary_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_itinerary error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Gagal menghapus itinerary.")
 
 
 # ============================================================
@@ -1362,25 +1576,42 @@ async def delete_itinerary(itinerary_id: str, current_user=Depends(get_current_u
 # ============================================================
 
 @app.get("/api/place/search", tags=["Place Search"])
+@limiter.limit(RATE_SEARCH)
 async def manual_search_place(
-    query: str = Query(...),
+    request: Request,
+    # max_length=200 prevents oversized queries being sent to the database
+    query: str = Query(..., max_length=200, min_length=1),
     category: Literal["attraction", "hotel", "restaurant"] = Query("attraction"),
     current_user=Depends(get_current_user),
 ):
-    results = await supabase_service.search_specific_place(query, category)
-    return {"results": results, "count": len(results)}
+    try:
+        results = await supabase_service.search_specific_place(query.strip(), category)
+        return {"results": results, "count": len(results)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"place_search error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Gagal mencari tempat.")
 
 
 @app.get("/api/place/recommendations", tags=["Place Search"])
+@limiter.limit(RATE_SEARCH)
 async def get_place_recommendations(
-    query: str = Query(...),
+    request: Request,
+    query: str = Query(..., max_length=200, min_length=1),
     category: Literal["poi", "hotel", "restaurant"] = Query("poi"),
     limit: int = Query(10, ge=1, le=30),
     current_user=Depends(get_current_user),
 ):
-    raw = await supabase_service.search_pois_semantic(query=query, limit=limit * 2)
-    ranked = cluster_and_rank_pois(raw, num_clusters=1, top_n_per_cluster=limit, category=category)
-    return {"results": ranked, "count": len(ranked), "query": query}
+    try:
+        raw = await supabase_service.search_pois_semantic(query=query.strip(), limit=limit * 2)
+        ranked = cluster_and_rank_pois(raw, num_clusters=1, top_n_per_cluster=limit, category=category)
+        return {"results": ranked, "count": len(ranked), "query": query}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"place_recommendations error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Gagal mengambil rekomendasi tempat.")
 
 
 # ============================================================
@@ -1388,7 +1619,8 @@ async def get_place_recommendations(
 # ============================================================
 
 @app.get("/health", tags=["System"])
-async def health_check():
+@limiter.limit(RATE_HEALTH)
+async def health_check(request: Request):
     return {
         "status": "healthy",
         "version": "8.0",
@@ -1399,6 +1631,8 @@ async def health_check():
             "hotel_guarantee",
             "odalan_safety_check",
             "tomtom_routing",
+            "rate_limiting",
+            "security_headers",
         ]
     }
 
