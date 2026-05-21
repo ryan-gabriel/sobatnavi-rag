@@ -1358,6 +1358,18 @@ async def delete_itinerary(itinerary_id: str, current_user=Depends(get_current_u
 
 
 # ============================================================
+# CHAT MESSAGES ENDPOINT
+# ============================================================
+
+@app.get("/api/chat/sessions/{session_id}/messages", tags=["AI Chat"])
+async def get_chat_messages(session_id: str):
+    history = await supabase_service.get_chat_history(session_id)
+    if not history:
+        return []
+    return history
+
+
+# ============================================================
 # PLACE SEARCH ENDPOINTS
 # ============================================================
 
@@ -1378,7 +1390,15 @@ async def get_place_recommendations(
     limit: int = Query(10, ge=1, le=30),
     current_user=Depends(get_current_user),
 ):
-    raw = await supabase_service.search_pois_semantic(query=query, limit=limit * 2)
+    if category in ["hotel", "restaurant"]:
+        raw = await supabase_service.search_amenities_semantic(
+            query=query, 
+            amenity_type=category, 
+            limit=limit * 2
+        )
+    else:
+        raw = await supabase_service.search_pois_semantic(query=query, limit=limit * 2)
+        
     ranked = cluster_and_rank_pois(raw, num_clusters=1, top_n_per_cluster=limit, category=category)
     return {"results": ranked, "count": len(ranked), "query": query}
 
