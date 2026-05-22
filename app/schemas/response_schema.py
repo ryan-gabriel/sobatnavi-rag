@@ -885,8 +885,9 @@ class FinalAIResponse(BaseModel):
             "Daftar jadwal harian lengkap. WAJIB diisi saat response_type='itinerary'. "
             "Panjang array = jumlah hari perjalanan (day=1 s.d. N). "
             "Setiap DailyItinerary WAJIB punya: "
-            "minimal 2 attraction, minimal 1 restaurant, "
-            "dan semua route_to_next terisi dari calculate_batch_routes. "
+            "minimal 2 attraction, minimal 1 restaurant. "
+            "Semua field rute (route_to_next, route_from_hotel, day_full_polyline, dll.) "
+            "HARUS null — diisi OTOMATIS oleh backend Python setelah JSON divalidasi. "
             "Urutan array: [hari_ke_1, hari_ke_2, ..., hari_ke_N]."
         ),
     )
@@ -902,7 +903,6 @@ class FinalAIResponse(BaseModel):
     )
 
     session_id: Optional[str] = Field(None, description="ID sesi aktif (dikembalikan ke frontend untuk multi-turn)")
-    itinerary_id: Optional[str] = Field(None, description="ID itinerary yang disimpan (populated setelah save)")
 
     budget_breakdown: Optional[BudgetBreakdown] = Field(
         default=None,
