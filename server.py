@@ -8,9 +8,9 @@ from app.services.supabase_service import supabase_service
 from app.services.tomtom_service import tomtom_service
 from app.services.live_intel_service import live_intel_service
 from app.engine.odalan_checker import evaluate_odalan_status, extract_global_avoid_zones
-from app.engine.recommender import cluster_and_rank_pois
+from app.engine.recommender import generate_clustered_pool_delivery, rank_pois_by_topsis
 
-mcp = FastMCP("SobatNavi", version="4.0.0")
+mcp = FastMCP("SobatNavi", version="5.0.0")
 
 # MCP TOOLS
 
@@ -40,25 +40,30 @@ async def get_bali_context(
 @mcp.tool()
 async def get_smart_recommendations(
     query: str = Field(..., description="Kata kunci tema wisata"),
-    num_days: int = Field(1, description="Jumlah hari"),
-    limit_per_day: int = Field(4, description="Tempat per hari"),
+    num_days: int = Field(1, description="Jumlah hari perjalanan"),
     category: str = Field("poi", description="'poi', 'hotel', atau 'restaurant'"),
-    preference_mode: str = Field("standard", description="'standard', 'hidden_gem', 'luxury', 'budget'")
+    preference_mode: str = Field("standard", description="'standard', 'hidden_gem', 'luxury', 'budget'"),
+    user_detected_location: str = Field(None, description="District/area Bali yang disebutkan user (opsional)")
 ) -> list[dict]:
-    """Cari tempat wisata dengan Semantic RAG, DBSCAN, dan TOPSIS."""
+    """
+    Cari tempat wisata dengan Radius & Anchor-First clustering + TOPSIS ranking.
+    Untuk category='poi': mengembalikan pool POI + restoran per hari yang geographically tight.
+    Output berisi per-hari: {day, anchor, pois[], restaurants[]}.
+    """
     if category == "hotel":
-        raw_pois = await supabase_service.search_amenities_semantic(query, "hotel", limit=40)
+        raw = await supabase_service.search_amenities_semantic(query, "hotel", limit=40)
+        return rank_pois_by_topsis(raw, category="hotel", preference_mode=preference_mode, top_n=10)
     elif category == "restaurant":
-        raw_pois = await supabase_service.search_amenities_semantic(query, "restaurant", limit=40)
+        raw = await supabase_service.search_amenities_semantic(query, "restaurant", limit=40)
+        return rank_pois_by_topsis(raw, category="restaurant", preference_mode=preference_mode, top_n=10)
     else:
-        raw_pois = await supabase_service.search_pois_semantic(query=query, limit=40)
-    return cluster_and_rank_pois(
-        raw_pois,
-        num_clusters=num_days,
-        top_n_per_cluster=limit_per_day,
-        category=category,
-        preference_mode=preference_mode,
-    )
+        return await generate_clustered_pool_delivery(
+            supabase_service=supabase_service,
+            query=query,
+            num_days=num_days,
+            user_detected_location=user_detected_location,
+            preference_mode=preference_mode,
+        )
 
 
 @mcp.tool()

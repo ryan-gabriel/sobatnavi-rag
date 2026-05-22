@@ -1,14 +1,14 @@
-# api.py — SobatNavi AI Agent v8.0
+# api.py — SobatNavi AI Agent v9.0
 # ============================================================
-# PERUBAHAN UTAMA dari v7:
-#   1. POI_BUDGET: Kalkulasi jumlah POI per hari secara programatik
-#      (mempertimbangkan pace, durasi, dan preferensi user)
-#   2. MEAL INJECTION: Backend secara aktif menyisipkan restoran
-#      untuk sarapan/makan siang/makan malam — tidak lagi mengandalkan AI
-#   3. HOTEL GUARANTEE: Jika AI tidak menghasilkan base_hotel,
-#      backend mencarinya secara otomatis dari database
-#   4. EDGE CASES: Trip setengah hari, trip sangat panjang (7+ hari),
-#      database kosong/sedikit hasil, restoran tidak ditemukan di sekitar POI
+# PERUBAHAN UTAMA dari v8:
+#   1. RADIUS & ANCHOR-FIRST: DBSCAN diganti dengan metode clustering
+#      berbasis anchor per hari yang geographically tight
+#   2. AI MEAL SCHEDULING: Restoran kini dikirim dalam pool per hari
+#      dan AI (Heidi) yang menjadwalkan di waktu makan yang tepat
+#   3. HOTEL GUARANTEE: Tidak berubah dari v8
+#   4. TOPSIS RANKING: Tetap digunakan untuk scoring internal
+#   5. ANTI-DUPLICATION: Set-based dedup mencegah POI/restoran
+#      muncul berulang lintas hari
 # ============================================================
 
 from server import validate_itinerary_safety
@@ -37,7 +37,7 @@ from app.services.supabase_service import supabase_service
 from app.services.tomtom_service import tomtom_service
 from app.services.live_intel_service import live_intel_service
 from app.engine.odalan_checker import extract_global_avoid_zones
-from app.engine.recommender import cluster_and_rank_pois
+from app.engine.recommender import generate_clustered_pool_delivery, rank_pois_by_topsis
 from app.core.config import settings
 from app.core.rate_limiter import (
     limiter,
@@ -288,89 +288,141 @@ def calculate_poi_budget(
     }
 
 
-def extract_trip_parameters_from_message(message: str) -> dict:
+async def extract_trip_parameters_from_message(message: str, db_districts: list[str]) -> dict:
     """
-    Parsing sederhana pesan user untuk mendeteksi:
-    - Pace (santai, padat, dll)
-    - Apakah user menyebut jumlah tempat spesifik
-    - Apakah trip setengah hari
-
-    Ini hanya fallback. Heidi (AI) tetap menginterpretasi pesan
-    secara lebih akurat. Hasilnya dikirimkan ke AI sebagai konteks tambahan.
+    Menggunakan LLM murah (gpt-4.1-nano) untuk menganalisis pesan user secara akurat dan mengekstrak:
+    - pace: "santai" (santai/slow/rileks), "padat" (padat/penuh/banyak tempat), atau "normal" (default)
+    - is_half_day: true jika user menyebut trip setengah hari/beberapa jam saja, false jika tidak
+    - user_requested_pois: jumlah tempat spesifik yang ingin dikunjungi jika user menyebutkannya (int atau null)
+    - detected_location: nama raw lokasi/daerah yang disebutkan user (misal: 'Kuta', 'Ubud', dll., atau null)
+    - normalized_districts: list of strings (matching names in db_districts)
     """
-    msg_lower = message.lower()
-
-    pace = "normal"
-    if any(k in msg_lower for k in ["santai", "slow", "rileks", "bersantai", "tenang"]):
-        pace = "santai"
-    elif any(k in msg_lower for k in ["padat", "penuh", "banyak tempat", "maksimal", "semua"]):
-        pace = "padat"
-
-    is_half_day = any(k in msg_lower for k in ["setengah hari", "half day", "beberapa jam", "sore aja", "pagi aja"])
-
-    # Deteksi angka eksplisit: "3 tempat", "5 wisata", dll
-    import re
-    user_requested_pois = None
-    patterns = [
-        r"(\d+)\s*(tempat|lokasi|wisata|destinasi|spot|poi)",
-        r"kunjungi\s+(\d+)",
-        r"hanya\s+(\d+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, msg_lower)
-        if match:
-            user_requested_pois = int(match.group(1))
-            break
-
-    return {
-        "pace": pace,
-        "is_half_day": is_half_day,
-        "user_requested_pois": user_requested_pois,
-    }
+    try:
+        client = _get_client()
+        prompt = (
+            "Analyze the travel planning message and return a JSON object containing exactly these fields:\n"
+            "- pace: string, one of 'santai' (leisurely/slow/relaxed), 'padat' (busy/full/packed), 'normal' (default/standard).\n"
+            "- is_half_day: boolean, true if the user explicitly asks for a half-day trip, a few hours, or only morning/afternoon. Otherwise false.\n"
+            "- user_requested_pois: integer or null, the specific number of places/spots/attractions the user requested to visit in a day. If not specified, return null.\n"
+            "- detected_location: string or null, the raw location/area/district name mentioned by the user (e.g. 'Kuta', 'Ubud'). If none mentioned, return null.\n"
+            "- normalized_districts: list of strings, map any mentioned location to the matching items in this allowed list:\n"
+            f"{db_districts}\n"
+            "If no specific location is mentioned or cannot be resolved, return an empty list.\n\n"
+            "Return ONLY a raw JSON object, no markdown, no backticks."
+        )
+        response = await client.chat.completions.create(
+            model=settings.openai_model_id,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": message}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=150
+        )
+        data = json.loads(response.choices[0].message.content)
+        
+        # Validation / normalization fallback
+        pace = str(data.get("pace", "normal")).lower()
+        if pace not in ["santai", "normal", "padat"]:
+            pace = "normal"
+            
+        is_half_day = bool(data.get("is_half_day", False))
+        
+        user_requested_pois = data.get("user_requested_pois")
+        if user_requested_pois is not None:
+            try:
+                user_requested_pois = int(user_requested_pois)
+            except Exception:
+                user_requested_pois = None
+                
+        detected_location = data.get("detected_location")
+        if detected_location:
+            detected_location = str(detected_location).strip()
+            
+        normalized_districts = data.get("normalized_districts", [])
+        if not isinstance(normalized_districts, list):
+            normalized_districts = []
+        valid_districts = [d for d in normalized_districts if d in db_districts]
+        
+        return {
+            "pace": pace,
+            "is_half_day": is_half_day,
+            "user_requested_pois": user_requested_pois,
+            "detected_location": detected_location,
+            "normalized_districts": valid_districts
+        }
+    except Exception as e:
+        logger.warning(f"Gagal mengekstrak parameter perjalanan menggunakan AI: {e}. Menggunakan fallback regex.")
+        # Fallback ke pencarian regex jika LLM gagal
+        msg_lower = message.lower()
+        pace = "normal"
+        if any(k in msg_lower for k in ["santai", "slow", "rileks", "bersantai", "tenang"]):
+            pace = "santai"
+        elif any(k in msg_lower for k in ["padat", "penuh", "banyak tempat", "maksimal", "semua"]):
+            pace = "padat"
+        is_half_day = any(k in msg_lower for k in ["setengah hari", "half day", "beberapa jam", "sore aja", "pagi aja"])
+        import re
+        user_requested_pois = None
+        patterns = [
+            r"(\d+)\s*(tempat|lokasi|wisata|destinasi|spot|poi)",
+            r"kunjungi\s+(\d+)",
+            r"hanya\s+(\d+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, msg_lower)
+            if match:
+                user_requested_pois = int(match.group(1))
+                break
+        return {
+            "pace": pace,
+            "is_half_day": is_half_day,
+            "user_requested_pois": user_requested_pois,
+            "detected_location": None,
+            "normalized_districts": []
+        }
 
 
 # ============================================================
-# MEAL SLOT DEFINITIONS
+# MEAL SLOT DEFINITIONS (DEPRECATED v9.0 — kept for reference)
 # ============================================================
+# Meal scheduling is now handled by Heidi AI using the restaurant
+# pool data from generate_clustered_pool_delivery.
+# The backend no longer injects restaurants programmatically.
 
-MEAL_SLOTS = {
-    # meal_type → (visit_time_24h, estimated_duration_mins, estimated_cost_idr, tags)
-    "sarapan": {
-        "visit_time": "08:00",
-        "visit_duration_mins": 45,
-        "estimated_cost_idr": 50000,
-        "tags": ["sarapan", "kuliner", "pagi"],
-        "label": "☕ Sarapan",
-    },
-    "makan_siang": {
-        "visit_time": "12:30",
-        "visit_duration_mins": 60,
-        "estimated_cost_idr": 75000,
-        "tags": ["makan siang", "kuliner", "restoran"],
-        "label": "🍽️ Makan Siang",
-    },
-    "makan_malam": {
-        "visit_time": "19:00",
-        "visit_duration_mins": 75,
-        "estimated_cost_idr": 100000,
-        "tags": ["makan malam", "kuliner", "dinner"],
-        "label": "🌙 Makan Malam",
-    },
-}
+# MEAL_SLOTS = {
+#     "sarapan": {
+#         "visit_time": "08:00",
+#         "visit_duration_mins": 45,
+#         "estimated_cost_idr": 50000,
+#         "tags": ["sarapan", "kuliner", "pagi"],
+#         "label": "☕ Sarapan",
+#     },
+#     "makan_siang": {
+#         "visit_time": "12:30",
+#         "visit_duration_mins": 60,
+#         "estimated_cost_idr": 75000,
+#         "tags": ["makan siang", "kuliner", "restoran"],
+#         "label": "🍽️ Makan Siang",
+#     },
+#     "makan_malam": {
+#         "visit_time": "19:00",
+#         "visit_duration_mins": 75,
+#         "estimated_cost_idr": 100000,
+#         "tags": ["makan malam", "kuliner", "dinner"],
+#         "label": "🌙 Makan Malam",
+#     },
+# }
 
-
-def assign_meal_slots(meals_per_day: int) -> list[str]:
-    """
-    Menentukan sesi makan mana yang akan disisipkan berdasarkan jumlah meals_per_day.
-    """
-    if meals_per_day <= 0:
-        return []
-    elif meals_per_day == 1:
-        return ["makan_siang"]
-    elif meals_per_day == 2:
-        return ["makan_siang", "makan_malam"]
-    else:
-        return ["sarapan", "makan_siang", "makan_malam"]
+# def assign_meal_slots(meals_per_day: int) -> list[str]:
+#     if meals_per_day <= 0:
+#         return []
+#     elif meals_per_day == 1:
+#         return ["makan_siang"]
+#     elif meals_per_day == 2:
+#         return ["makan_siang", "makan_malam"]
+#     else:
+#         return ["sarapan", "makan_siang", "makan_malam"]
 
 
 # ============================================================
@@ -395,36 +447,35 @@ async def get_bali_context(date_start: str, date_end: str, district: str = "Bali
 async def get_smart_recommendations(
     query: str,
     num_days: int = 1,
-    limit_per_day: int = 4,
     category: str = "poi",
     preference_mode: str = "standard",
+    user_detected_location: str = None,
 ) -> list[dict]:
     """
-    Cari tempat wisata menggunakan Semantic Search (RAG), cluster per hari (DBSCAN),
-    dan ranking berdasarkan TOPSIS multi-dimensi.
+    Cari tempat wisata menggunakan Radius & Anchor-First clustering.
 
-    limit_per_day akan di-override oleh poi_budget yang dikalkulasi backend.
-    Namun AI tetap bisa menyesuaikan jika user minta secara eksplisit.
+    Untuk category='poi':
+      Menggunakan generate_clustered_pool_delivery untuk menghasilkan
+      pool POI + restoran per hari yang geographically tight.
+
+    Untuk category='hotel'/'restaurant':
+      Menggunakan semantic search + TOPSIS ranking (tanpa spatial clustering).
     """
-    # Selalu fetch 3x lebih banyak dari yang dibutuhkan untuk memastikan
-    # TOPSIS + DBSCAN punya cukup data untuk memilih yang terbaik
-    fetch_count = limit_per_day * 3 * num_days
-    fetch_count = max(30, min(fetch_count, 80))  # Clamp: 30-80
-
     if category == "hotel":
-        raw = await supabase_service.search_amenities_semantic(query, "hotel", limit=fetch_count)
+        raw = await supabase_service.search_amenities_semantic(query, "hotel", limit=40)
+        return rank_pois_by_topsis(raw, category="hotel", preference_mode=preference_mode, top_n=10)
     elif category == "restaurant":
-        raw = await supabase_service.search_amenities_semantic(query, "restaurant", limit=fetch_count)
+        raw = await supabase_service.search_amenities_semantic(query, "restaurant", limit=40)
+        return rank_pois_by_topsis(raw, category="restaurant", preference_mode=preference_mode, top_n=10)
     else:
-        raw = await supabase_service.search_pois_semantic(query=query, limit=fetch_count)
-
-    return cluster_and_rank_pois(
-        raw,
-        num_clusters=num_days,
-        top_n_per_cluster=limit_per_day,
-        category=category,
-        preference_mode=preference_mode,
-    )
+        # POI: Radius & Anchor-First clustering
+        return await generate_clustered_pool_delivery(
+            supabase_service=supabase_service,
+            query=query,
+            num_days=num_days,
+            user_detected_location=user_detected_location,
+            preference_mode=preference_mode,
+        )
 
 
 async def search_specific_place(query: str, category: str = "attraction") -> dict:
@@ -439,6 +490,31 @@ async def search_specific_place(query: str, category: str = "attraction") -> dic
             if results
             else f"Tempat '{query}' TIDAK DITEMUKAN di database. Jangan mengarang data. Tawarkan alternatif kepada user."
         )
+    }
+
+
+async def search_specific_place_nearby(
+    query: str, lat: float, lng: float, radius_m: float = 15000
+) -> dict:
+    """
+    Cari tempat SPESIFIK berdasarkan nama DAN memastikan lokasinya
+    berdekatan dengan koordinat (lat, lng) dalam radius radius_m meter.
+    Gunakan tool ini saat MENAMBAH tempat ke itinerary yang sedang diedit,
+    agar tempat baru tidak merusak rute harian yang sudah ada.
+    """
+    results = await supabase_service.search_specific_place_nearby(query, lat, lng, radius_m)
+    return {
+        "found": len(results) > 0,
+        "count": len(results),
+        "results": results,
+        "message": (
+            f"Ditemukan {len(results)} tempat '{query}' dalam radius {radius_m/1000:.1f} km."
+            if results
+            else (
+                f"Tempat '{query}' TIDAK DITEMUKAN dalam radius {radius_m/1000:.1f} km dari koordinat tersebut. "
+                "Coba perluas radius, atau gunakan search_specific_place tanpa filter lokasi."
+            )
+        ),
     }
 
 
@@ -467,6 +543,7 @@ AVAILABLE_FUNCTIONS = {
     "get_bali_context": get_bali_context,
     "get_smart_recommendations": get_smart_recommendations,
     "search_specific_place": search_specific_place,
+    "search_specific_place_nearby": search_specific_place_nearby,
     "get_nearby_places": get_nearby_places,
     "validate_itinerary_safety": validate_itinerary_safety,
     "get_inspiration_narration": get_inspiration_narration,
@@ -494,25 +571,26 @@ OPENAI_TOOLS = [
         "function": {
             "name": "get_smart_recommendations",
             "description": (
-                "Cari tempat wisata Semantic Search, cluster per hari & TOPSIS. "
-                "Parameter limit_per_day SUDAH DIKALKULASI oleh sistem (lihat poi_budget di context). "
-                "Gunakan nilai dari poi_budget.attractions_per_day untuk parameter ini. "
+                "Cari tempat wisata dengan Radius & Anchor-First clustering + TOPSIS ranking. "
+                "Tool ini menghasilkan pool POI dan restoran per hari yang geographically tight. "
+                "Untuk category='poi': mengembalikan list per hari berisi {day, anchor, pois[], restaurants[]}. "
+                "Restoran SUDAH disertakan di output tool — kamu WAJIB memasukkannya ke dalam places di waktu makan. "
                 "Gunakan preference_mode='hidden_gem' untuk tempat tersembunyi, "
                 "'luxury' untuk premium, 'budget' untuk hemat."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "num_days": {"type": "integer"},
-                    "limit_per_day": {
-                        "type": "integer",
-                        "description": "Jumlah atraksi per hari. WAJIB ambil dari poi_budget.attractions_per_day di context system."
-                    },
+                    "query": {"type": "string", "description": "Kata kunci tema wisata (misal: 'pantai sunset', 'budaya ubud')"},
+                    "num_days": {"type": "integer", "description": "Jumlah hari perjalanan. WAJIB sesuai permintaan user."},
                     "category": {"type": "string", "enum": ["poi", "hotel", "restaurant"]},
                     "preference_mode": {
                         "type": "string",
                         "enum": ["standard", "hidden_gem", "luxury", "budget"],
+                    },
+                    "user_detected_location": {
+                        "type": "string",
+                        "description": "District/area Bali yang disebutkan user (misal: 'Ubud', 'Kuta'). Opsional."
                     }
                 },
                 "required": ["query"]
@@ -576,6 +654,29 @@ OPENAI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_specific_place_nearby",
+            "description": (
+                "Cari tempat SPESIFIK berdasarkan nama DAN memastikan lokasinya berdekatan "
+                "dengan koordinat referensi dalam radius tertentu. "
+                "WAJIB digunakan saat MENAMBAH tempat baru ke itinerary yang sedang diedit — "
+                "ambil lat/lng dari salah satu tempat yang sudah ada di hari tersebut. "
+                "Ini mencegah tempat baru yang jauh merusak efisiensi rute harian."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Nama atau kata kunci tempat yang dicari."},
+                    "lat": {"type": "number", "description": "Latitude titik referensi (dari tempat yang sudah ada di hari itu)."},
+                    "lng": {"type": "number", "description": "Longitude titik referensi (dari tempat yang sudah ada di hari itu)."},
+                    "radius_m": {"type": "number", "description": "Radius pencarian dalam meter. Default: 15000 (15 km)."}
+                },
+                "required": ["query", "lat", "lng"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_inspiration_narration",
             "description": (
                 "Ambil cerita/narasi puitis tentang suatu tempat atau kawasan di Bali. "
@@ -617,25 +718,25 @@ def build_heidi_prompt(
     }
     _budget_label = _budget_label_map.get(preference_mode, _budget_label_map["standard"])
 
-    # Informasikan AI tentang POI budget yang sudah dikalkulasi backend
+    # Informasikan AI tentang perubahan arsitektur v9.0
     poi_budget_context = f"""
 ═══════════════════════════════════════════════
-KONTEKS SISTEM: POI BUDGET (SUDAH DIKALKULASI — IKUTI INI)
+KONTEKS SISTEM: RADIUS & ANCHOR-FIRST CLUSTERING (v9.0)
 ═══════════════════════════════════════════════
-Backend telah menghitung jumlah POI yang masuk akal berdasarkan pesan user:
+Backend menggunakan metode clustering baru untuk menghasilkan
+pool POI + restoran yang geographically tight per hari.
 
   • Pace perjalanan        : {poi_budget.get('pace_label', 'normal')}
-  • Atraksi per hari       : {poi_budget.get('attractions_per_day', 4)} tempat wisata
-  • Sesi makan per hari    : {poi_budget.get('meals_per_day', 2)} sesi makan (diisi backend, JANGAN kamu isi)
-  • Total places per hari  : {poi_budget.get('total_places_per_day', 6)} (atraksi + makan)
+  • Atraksi per hari       : {poi_budget.get('attractions_per_day', 4)} tempat wisata (default, bisa dinamis 2-4)
   • Preferensi anggaran    : {_budget_label}
 
-INSTRUKSI TERKAIT:
-  ✅ Saat memanggil get_smart_recommendations, gunakan limit_per_day={poi_budget.get('attractions_per_day', 4)}
+PERUBAHAN PENTING v9.0:
+  ✅ Tool get_smart_recommendations kini mengembalikan data PER HARI:
+     [{{"day": 1, "anchor": {{...}}, "pois": [...], "restaurants": [...]}}, ...]
+  ✅ Restoran SUDAH TERMASUK di output tool — KAMU WAJIB memasukkannya ke places[]
+  ✅ Sisipkan restoran di slot waktu makan: Lunch (12:00-13:30), Dinner (18:30-20:00)
+  ✅ Urutkan semua places berdasarkan visit_time secara kronologis
   ✅ Saat memanggil get_smart_recommendations, WAJIB sertakan preference_mode="{preference_mode}"
-  ✅ JANGAN sertakan restoran/warung makan di dalam array places — backend akan menyisipkannya otomatis
-  ✅ Jika user bertanya jumlah tempat dan terasa sedikit, jelaskan bahwa sesi makan sudah disisipkan terpisah
-  ✅ Fetch dari DB: backend menggunakan multiplier 3x untuk seleksi TOPSIS yang lebih baik
 """
 
     if is_editing:
@@ -650,7 +751,7 @@ Kamu sedang memodifikasi itinerary berikut:
 ATURAN EDIT:
 1. HAPUS TEMPAT BERDASARKAN NAMA: Cari item di array `places` yang namanya cocok, keluarkan dari array.
 2. HAPUS TEMPAT BERDASARKAN POSISI: Gunakan indeks array (0-based).
-3. TAMBAH TEMPAT DENGAN NAMA SPESIFIK: WAJIB panggil `search_specific_place`. Jika tidak ditemukan, JANGAN mengarang data.
+3. TAMBAH TEMPAT SPESIFIK: WAJIB panggil tool `search_specific_place_nearby`. Untuk parameter `lat` dan `lng`, kamu WAJIB mengambil latitude dan longitude dari salah satu tempat wisata (POI) yang SUDAH ADA di dalam array hari tersebut. Ini untuk memastikan tempat yang baru ditambahkan jaraknya berdekatan dan tidak merusak rute.
 4. TAMBAH TEMPAT TANPA NAMA (tema/vibe): Panggil `get_nearby_places` atau `get_smart_recommendations`.
 5. JANGAN menghitung atau mengisi field rute apapun.
 6. Kembalikan SELURUH struktur itinerary yang sudah dimodifikasi.
@@ -688,6 +789,51 @@ MODE: GENERAL (Langsung Proses)
   JANGAN BERTANYA jika data kurang! Langsung buatkan dengan asumsi!
 """
 
+    # ── Dynamic rule 12 & workflow: completely different in edit vs. create mode ──
+    if is_editing:
+        rule_12_dynamic = (
+            "12. **ABAIKAN KUOTA MINIMUM & HANDLING HARI KOSONG**: Karena ini mode EDIT, kamu WAJIB "
+            "MENGABAIKAN aturan batas minimum atraksi harian. Biarkan array `places` pada hari tersebut "
+            "berkurang atau kosong jika user memang memintanya.\n"
+            "⚠️ **[CRITICAL EDGE CASE - HARI KOSONG]**: Jika penghapusan tempat oleh user mengakibatkan "
+            "array `places` pada suatu hari menjadi KOSONG TOTAL, kamu WAJIB mendeteksinya secara sadar "
+            "(self-aware). Jangan diam saja! Di dalam `message_to_user`, beritahu user secara ramah bahwa "
+            "jadwal untuk hari tersebut sekarang kosong, lalu berikan saran ide/opsi aktivitas menarik "
+            "untuk mengisinya kembali."
+        )
+
+        workflow_instruction = """
+═══════════════════════════════════════════════
+ALUR KERJA EDIT ITINERARY (PARTIAL UPDATE ONLY)
+═══════════════════════════════════════════
+STEP 1 → Analisis pesan user: Apakah meminta HAPUS (Delete) atau TAMBAH (Add)?
+STEP 2 → JIKA USER MINTA HAPUS: Cukup hilangkan objek tempat tersebut dari array `places` pada hari yang dimaksud. JANGAN panggil tool pencarian global atau nearby apa pun! Cukup eliminasi item dari array JSON yang sudah ada.
+STEP 3 → JIKA USER MINTA TAMBAH TEMPAT SPESIFIK: Kamu WAJIB memanggil tool `search_specific_place_nearby`. Untuk parameter `lat` dan `lng`, kamu WAJIB mengambil koordinat dari salah satu tempat wisata (POI) yang SUDAH ADA di dalam array hari tersebut. Ini untuk memastikan tempat baru dikunci dalam radius berdekatan (~15km) dan tidak membuat rute hari itu melompat jauh.
+STEP 4 → JIKA USER MINTA TAMBAH TEMPAT SECARA UMUM/GENERIK (e.g., "tambahkan pantai", "tambahkan pura", "tambahkan tempat apa saja"): Kamu WAJIB memanggil `get_smart_recommendations` atau `get_nearby_places` menggunakan koordinat hari yang bersangkutan sebagai anchor. DILARANG KERAS mengembalikan `response_type: "chat"` hanya karena tempat yang diminta tidak spesifik. Kamu HARUS memproses pencarian ini dan menggabungkan tempat baru tersebut ke dalam itinerary.
+STEP 5 → IMMUTABLE CLONING (MANDATORY): Untuk hari-hari (Day) atau data lain yang TIDAK diminta untuk diubah oleh user, kamu WAJIB menyalin (clone) seluruh strukturnya secara persis 100% tanpa mengubah data, urutan jam, nama, atau narasinya sedikit pun!
+STEP 6 → LARANGAN ROUTING: Biarkan semua field rute harian (`route_to_next`, `day_full_polyline`, `day_total_distance_km`, `day_total_travel_time_mins`) selalu bernilai `null` karena backend TomTom yang akan menghitung ulang jalurnya secara otomatis setelah JSON divalidasi.
+STEP 7 → Tulis narasi konfirmasi hangat di `message_to_user` dan kembalikan struktur JSON penuh. Pastikan `response_type` tetap `"itinerary"`.
+"""
+    else:
+        rule_12_dynamic = (
+            f"12. **ATRAKSI MINIMUM**: Setiap hari WAJIB memiliki minimal "
+            f"{poi_budget.get('min_attractions', 2)} atraksi wisata (di luar restoran). "
+            "Jika bahan dari tool kurang, panggil tool kembali dengan query berbeda."
+        )
+
+        workflow_instruction = f"""
+═══════════════════════════════════════════════
+ALUR KERJA PEMBUATAN ITINERARY BARU (FULL GENERATION)
+═══════════════════════════════════════════════
+STEP 1 → Panggil `get_bali_context(date_start, date_end, district)` untuk mengambil info cuaca & avoid_zones.
+STEP 2 → Panggil `get_smart_recommendations(query, num_days=N, category="poi", preference_mode="{preference_mode}")` untuk menarik data POI + Restoran terkluster.
+STEP 3 → Panggil `get_nearby_places(lat, lng, category="hotel")` menggunakan anchor koordinat Hari 1 untuk menentukan `base_hotel`.
+STEP 4 → Panggil `validate_itinerary_safety(poi_ids, date_start, date_end)` untuk memastikan keamanan ritual adat.
+STEP 5 → Susun `places` harian: gabungkan atraksi dan restoran, lalu URUTKAN KRONOLOGIS berdasarkan `visit_time`.
+STEP 6 → Tulis `message_to_user` berupa narasi storytelling yang hangat minimal 250 kata.
+STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
+"""
+
     return f"""
 Kamu adalah **Heidi**, asisten perjalanan AI spesialis Bali dari SobatNavi.
 Kepribadianmu: hangat, informatif, dan sangat paham budaya Bali.
@@ -713,22 +859,23 @@ ATURAN MUTLAK (WAJIB DIPATUHI)
    - `visit_time`: HH:MM 24-jam sesuai urutan (pagi mulai 08:00). WAJIB DIISI.
    - `tips`: Satu kalimat tip berguna. WAJIB DIISI.
    - `image_url`: Dari tool jika ada.
-7. **RESTORAN JANGAN DIISI DI ARRAY PLACES**: Backend akan menyisipkan restoran secara otomatis berdasarkan poi_budget.meals_per_day. KAMU TIDAK PERLU dan TIDAK BOLEH menambahkan restoran ke dalam array places.
-8. **KATEGORI TEMPAT**: Untuk field `category` di dalam objek tempat: HANYA "attraction", "hotel", atau "restaurant".
-9. **SUGGESTED REPLIES**: Selalu isi `suggested_replies` dengan 3 saran pertanyaan relevan.
-10. **ATRAKSI MINIMUM**: Setiap hari WAJIB memiliki minimal {poi_budget.get('min_attractions', 2)} atraksi. Jika kurang, panggil tool lagi dengan query berbeda.
+7. **HARI WAJIB SESUAI PERMINTAAN (CRITICAL)**:
+   Jika user meminta N hari, kamu WAJIB menghasilkan TEPAT N objek `day` di dalam `itinerary_days`.
+   DILARANG KERAS mengurangi jumlah hari. Jika pool POI kurang, variasikan query ke tool.
+8. **POI BUDGETING DINAMIS**:
+   Default: 2-4 atraksi per hari. TAPI jika user eksplisit minta jumlah tertentu
+   (misal "buat padat 5 tempat"), PATUHI permintaan user tersebut.
+9. **RESTORAN WAJIB DIMASUKKAN KE PLACES**:
+   Tool get_smart_recommendations menyediakan pool `restaurants[]` per hari.
+   KAMU WAJIB memasukkan restoran dari pool ini ke dalam array `places` pada waktu makan:
+   - Makan Siang (Lunch): visit_time antara 12:00 - 13:30
+   - Makan Malam (Dinner): visit_time antara 18:30 - 20:00
+   Urutkan semua places (atraksi + restoran) secara kronologis berdasarkan `visit_time`.
+10. **KATEGORI TEMPAT**: Untuk field `category` di dalam objek tempat: HANYA "attraction", "hotel", atau "restaurant".
+11. **SUGGESTED REPLIES**: Selalu isi `suggested_replies` dengan 3 saran pertanyaan relevan.
+{rule_12_dynamic}
 
-═══════════════════════════════════════════════
-ALUR KERJA PEMBUATAN ITINERARY
-═══════════════════════════════════════════════
-STEP 1 → get_bali_context(date_start, date_end, district)
-STEP 2 → get_smart_recommendations(query, num_days, limit_per_day={poi_budget.get('attractions_per_day', 4)}, category="poi")
-         ⚠️ JANGAN panggil get_smart_recommendations untuk category="restaurant" — backend handle ini.
-STEP 3 → get_nearby_places(lat, lng, category="hotel") untuk dapatkan base_hotel
-STEP 4 → validate_itinerary_safety(poi_ids, date_start, date_end)
-STEP 5 → Susun urutan kunjungan yang logis secara geografis (JANGAN hitung rute)
-STEP 6 → Tulis message_to_user Markdown (narasi storytelling min. 250 kata untuk itinerary)
-STEP 7 → Lengkapi trip_title, suggested_replies
+{workflow_instruction}
 
 ═══════════════════════════════════════════════
 SKEMA JSON OUTPUT (WAJIB IKUTI PERSIS)
@@ -738,172 +885,21 @@ SKEMA JSON OUTPUT (WAJIB IKUTI PERSIS)
 
 
 # ============================================================
-# BACKEND MEAL INJECTION
+# BACKEND MEAL INJECTION (DEPRECATED v9.0 — kept for reference)
 # ============================================================
+# Meal injection is now handled by Heidi AI.
+# Restaurants are delivered in the per-day pool from
+# generate_clustered_pool_delivery, and AI places them at
+# logical dining times (Lunch 12:00-13:30, Dinner 18:30-20:00).
 
-async def inject_meals_to_itinerary(
-    parsed_data: "FinalAIResponse",
-    poi_budget: dict,
-    district_hint: str = "Bali",
-    preference_mode: str = "standard",
-) -> "FinalAIResponse":
-    """
-    Menyisipkan restoran ke dalam setiap hari itinerary secara programatik.
-    Backend yang bertanggung jawab penuh atas meal slots — bukan AI.
-
-    Strategi:
-    1. Ambil koordinat sentroid dari semua atraksi di hari tersebut
-    2. Cari restoran terdekat dari sentroid menggunakan search_amenities_nearby
-    3. Fallback: semantic search dengan query district/tema jika nearby tidak ada hasil
-    4. Sisipkan restoran di slot waktu yang tepat (siang / malam)
-    """
-    if not parsed_data.itinerary_days:
-        return parsed_data
-
-    meals_per_day = poi_budget.get("meals_per_day", 2)
-    meal_slot_types = assign_meal_slots(meals_per_day)
-
-    if not meal_slot_types:
-        logger.info("meals_per_day=0, tidak ada restoran yang disisipkan.")
-        return parsed_data
-
-    for day in parsed_data.itinerary_days:
-        if not day.places:
-            continue
-
-        # Kumpulkan koordinat atraksi yang valid di hari ini
-        attraction_coords = [
-            (p.latitude, p.longitude)
-            for p in day.places
-            if p.latitude is not None and p.longitude is not None and p.category == "attraction"
-        ]
-
-        # Hitung sentroid
-        if attraction_coords:
-            centroid_lat = sum(c[0] for c in attraction_coords) / len(attraction_coords)
-            centroid_lng = sum(c[1] for c in attraction_coords) / len(attraction_coords)
-        else:
-            # Fallback: pakai koordinat Bali tengah jika tidak ada atraksi dengan koordinat
-            centroid_lat = -8.4095
-            centroid_lng = 115.1889
-            logger.warning(f"Hari {day.day}: Tidak ada koordinat atraksi valid, pakai sentroid Bali.")
-
-        # Cari restoran unik untuk setiap meal slot
-        already_used_ids = set()
-        restaurants_found = []
-
-        try:
-            # Pertama: coba nearby dalam radius 5km
-            nearby_restaurants = await supabase_service.search_amenities_nearby(
-                amenity_type="restaurant",
-                lat=centroid_lat,
-                lng=centroid_lng,
-                radius_m=5000,
-                limit=meals_per_day * 3,  # Ambil lebih banyak untuk fallback
-            )
-            restaurants_found = nearby_restaurants
-        except Exception as e:
-            logger.warning(f"Hari {day.day}: nearby restaurant gagal ({e}), coba semantic.")
-
-        # Fallback: semantic search jika nearby tidak cukup
-        if len(restaurants_found) < meals_per_day:
-            try:
-                _restaurant_query_map = {
-                    "budget": f"warung makan murah {district_hint} Bali harga terjangkau",
-                    "luxury": f"restoran fine dining mewah {district_hint} Bali premium",
-                }
-                semantic_query = _restaurant_query_map.get(preference_mode, f"restoran {district_hint} Bali")
-                semantic_restaurants = await supabase_service.search_amenities_semantic(
-                    query=semantic_query,
-                    amenity_type="restaurant",
-                    limit=meals_per_day * 3,
-                )
-                # Gabungkan, prioritaskan yang belum ada
-                existing_ids = {r.get("place_id") for r in restaurants_found}
-                for r in semantic_restaurants:
-                    if r.get("place_id") not in existing_ids:
-                        restaurants_found.append(r)
-                        existing_ids.add(r.get("place_id"))
-            except Exception as e:
-                logger.warning(f"Hari {day.day}: semantic restaurant fallback juga gagal ({e}).")
-
-        # Sisipkan restoran ke dalam places di posisi yang tepat
-        for i, meal_type in enumerate(meal_slot_types):
-            if not restaurants_found:
-                logger.warning(f"Hari {day.day}: Tidak ada restoran ditemukan untuk slot {meal_type}.")
-                break
-
-            # Pilih restoran yang belum dipakai
-            chosen = None
-            for r in restaurants_found:
-                rid = r.get("place_id", r.get("name", ""))
-                if rid not in already_used_ids:
-                    chosen = r
-                    already_used_ids.add(rid)
-                    break
-
-            if not chosen:
-                logger.warning(f"Hari {day.day}: Semua restoran sudah dipakai, skip slot {meal_type}.")
-                break
-
-            slot_config = MEAL_SLOTS[meal_type]
-            metadata = chosen.get("metadata") or {}
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except Exception:
-                    metadata = {}
-
-            # Buat PlaceItem untuk restoran ini
-            from app.schemas.response_schema import PlaceItem
-            restaurant_place = PlaceItem(
-                place_id=chosen.get("place_id"),
-                name=chosen.get("name", f"Restoran {meal_type.replace('_', ' ').title()}"),
-                category="restaurant",
-                latitude=chosen.get("latitude"),
-                longitude=chosen.get("longitude"),
-                district=chosen.get("district", district_hint),
-                rating=chosen.get("rating"),
-                image_url=chosen.get("image_url"),
-                visit_time=slot_config["visit_time"],
-                visit_duration_mins=slot_config["visit_duration_mins"],
-                estimated_cost_idr=slot_config["estimated_cost_idr"],
-                tags=slot_config["tags"],
-                tips=f"Nikmati {slot_config['label']} di sini. Cocok untuk pengunjung yang ingin cita rasa lokal.",
-                description=chosen.get("content", metadata.get("description", "")),
-                route_to_next=None,
-            )
-
-            # Tentukan posisi sisipan berdasarkan meal slot
-            current_places = list(day.places)
-            if meal_type == "sarapan":
-                # Sarapan di awal hari (index 0)
-                current_places.insert(0, restaurant_place)
-            elif meal_type == "makan_siang":
-                # Makan siang di tengah (setelah ~50% atraksi)
-                total_attractions = len([p for p in current_places if p.category == "attraction"])
-                mid_idx = max(1, total_attractions // 2)
-                # Cari posisi setelah mid_idx atraksi
-                attraction_count = 0
-                insert_pos = len(current_places)
-                for idx, p in enumerate(current_places):
-                    if p.category == "attraction":
-                        attraction_count += 1
-                        if attraction_count >= mid_idx:
-                            insert_pos = idx + 1
-                            break
-                current_places.insert(insert_pos, restaurant_place)
-            else:  # makan_malam
-                # Makan malam di akhir hari
-                current_places.append(restaurant_place)
-
-            day.places = current_places
-            logger.info(
-                f"Hari {day.day}: Sisip restoran '{restaurant_place.name}' untuk slot {meal_type} "
-                f"(lat={restaurant_place.latitude}, lng={restaurant_place.longitude})"
-            )
-
-    return parsed_data
+# async def inject_meals_to_itinerary(
+#     parsed_data: "FinalAIResponse",
+#     poi_budget: dict,
+#     district_hint: str = "Bali",
+#     preference_mode: str = "standard",
+# ) -> "FinalAIResponse":
+#     """DEPRECATED v9.0 — Meal injection sekarang dilakukan oleh AI."""
+#     pass
 
 
 # ============================================================
@@ -993,7 +989,7 @@ async def guarantee_base_hotel(
             logger.warning(f"Hotel semantic search fallback gagal: {e}")
 
     if hotel_data:
-        from app.schemas.response_schema import HotelItem
+        from app.schemas.response_schema import BaseHotel
         metadata = hotel_data.get("metadata") or {}
         if isinstance(metadata, str):
             try:
@@ -1001,7 +997,7 @@ async def guarantee_base_hotel(
             except Exception:
                 metadata = {}
 
-        parsed_data.base_hotel = HotelItem(
+        parsed_data.base_hotel = BaseHotel(
             place_id=hotel_data.get("place_id"),
             name=hotel_data.get("name", "Hotel Bali"),
             latitude=hotel_data.get("latitude"),
@@ -1014,16 +1010,14 @@ async def guarantee_base_hotel(
                 or metadata.get("description")
                 or "Akomodasi yang nyaman untuk perjalanan Anda di Bali."
             ),
-            price_level=hotel_data.get("price_level"),
-            estimated_cost_per_night_idr=None,  # Akan diisi AI atau dibiarkan null
         )
         logger.info(f"Hotel otomatis dipilih backend: {parsed_data.base_hotel.name}")
     else:
         # Final fallback: jika benar-benar tidak ada hotel di database
         # Isi dengan placeholder agar tidak crash
         logger.error("Tidak ada hotel ditemukan di database! Mengisi placeholder.")
-        from app.schemas.response_schema import HotelItem
-        parsed_data.base_hotel = HotelItem(
+        from app.schemas.response_schema import BaseHotel
+        parsed_data.base_hotel = BaseHotel(
             place_id=None,
             name="Hotel (Hubungi Admin)",
             latitude=ref_lat,
@@ -1032,8 +1026,6 @@ async def guarantee_base_hotel(
             rating=None,
             image_url=None,
             description="Sistem tidak dapat menemukan hotel di database. Silakan pilih hotel manual.",
-            price_level=None,
-            estimated_cost_per_night_idr=None,
         )
 
     return parsed_data
@@ -1071,6 +1063,110 @@ def sanitize_ai_output(raw_dict: dict) -> dict:
     Membersihkan dan memperbaiki output JSON AI sebelum validasi Pydantic.
     Menangani berbagai edge case dari output AI yang tidak sempurna.
     """
+    # 1. Deteksi dan isi response_type jika hilang
+    if "response_type" not in raw_dict or not raw_dict["response_type"]:
+        if "itinerary_days" in raw_dict and raw_dict["itinerary_days"]:
+            raw_dict["response_type"] = "itinerary"
+        elif "recommendations" in raw_dict and raw_dict["recommendations"]:
+            raw_dict["response_type"] = "recommendation"
+        elif "clarifying_questions" in raw_dict and raw_dict["clarifying_questions"]:
+            raw_dict["response_type"] = "clarifying"
+        else:
+            raw_dict["response_type"] = "chat"
+
+    # 2. Pastikan suggested_replies ada dan minimal 3 item
+    if "suggested_replies" not in raw_dict or not isinstance(raw_dict["suggested_replies"], list) or not raw_dict["suggested_replies"]:
+        raw_dict["suggested_replies"] = [
+            "Bagaimana cuaca di Bali sekarang?",
+            "Rekomendasikan pantai terdekat",
+            "Buatkan itinerary untuk area Ubud"
+        ]
+    elif len(raw_dict["suggested_replies"]) < 3:
+        while len(raw_dict["suggested_replies"]) < 3:
+            raw_dict["suggested_replies"].append("Tunjukkan opsi hotel lainnya")
+
+    # 3. Buat/perbaiki message_to_user jika hilang atau terlalu pendek
+    if "message_to_user" not in raw_dict or not raw_dict["message_to_user"] or len(str(raw_dict["message_to_user"]).strip()) < 5:
+        resp_type = raw_dict["response_type"]
+        if resp_type == "itinerary":
+            title = raw_dict.get("trip_title") or "Rencana Perjalanan Bali"
+            hotel_name = ""
+            if "base_hotel" in raw_dict and isinstance(raw_dict["base_hotel"], dict):
+                hotel_name = raw_dict["base_hotel"].get("name", "")
+            
+            msg = f"# ✈️ {title}\n\n"
+            msg += "Halo! Rencana perjalanan Anda di Bali telah siap disusun. Berikut adalah ringkasan itinerary harian Anda:\n\n"
+            
+            if hotel_name:
+                msg += f"🏨 **Akomodasi:** Menginap di **{hotel_name}** sebagai home base.\n\n"
+            
+            msg += "---\n\n"
+            
+            days = raw_dict.get("itinerary_days") or []
+            for d in days:
+                d_num = d.get("day", 1)
+                theme = d.get("theme") or "Eksplorasi"
+                date_str = d.get("date") or ""
+                date_part = f" · {date_str}" if date_str else ""
+                msg += f"## 🌅 Hari {d_num}{date_part} — {theme}\n"
+                
+                places = d.get("places") or []
+                for p in places:
+                    p_name = p.get("name", "Tempat")
+                    p_time = p.get("visit_time") or "08:00"
+                    p_cat = p.get("category") or "attraction"
+                    p_desc = p.get("description") or ""
+                    
+                    cat_emoji = "🍽️" if p_cat == "restaurant" else "🏨" if p_cat == "hotel" else "📍"
+                    msg += f"- **{p_time}** {cat_emoji} **{p_name}**: {p_desc}\n"
+                msg += "\n"
+                
+            msg += "---\n\n"
+            
+            budget = raw_dict.get("budget_breakdown") or {}
+            total = raw_dict.get("total_budget_idr") or 0
+            if budget or total:
+                msg += "## 💰 Estimasi Budget\n"
+                if budget.get("accommodation_idr"):
+                    msg += f"- 🏨 Akomodasi: Rp {budget['accommodation_idr']:,}\n".replace(",", ".")
+                if budget.get("food_idr"):
+                    msg += f"- 🍽️ Makan & Minum: Rp {budget['food_idr']:,}\n".replace(",", ".")
+                if budget.get("transport_idr"):
+                    msg += f"- 🚗 Transportasi: Rp {budget['transport_idr']:,}\n".replace(",", ".")
+                if budget.get("entrance_fee_idr"):
+                    msg += f"- 🎟️ Tiket Masuk: Rp {budget['entrance_fee_idr']:,}\n".replace(",", ".")
+                if budget.get("miscellaneous_idr"):
+                    msg += f"- 🛍️ Lain-lain: Rp {budget['miscellaneous_idr']:,}\n".replace(",", ".")
+                if total:
+                    msg += f"- **Total Estimasi: Rp {total:,}**\n\n".replace(",", ".")
+            
+            msg += "Apakah Anda ingin menyesuaikan tempat wisata atau mengganti hotel? Silakan beritahu saya!"
+            raw_dict["message_to_user"] = msg
+            
+        elif resp_type == "recommendation":
+            msg = "Berikut adalah beberapa rekomendasi tempat menarik di Bali untuk Anda:\n\n"
+            recs = raw_dict.get("recommendations") or []
+            for r in recs:
+                name = r.get("name", "Tempat")
+                desc = r.get("description") or ""
+                district = r.get("district") or "Bali"
+                rating = r.get("rating")
+                rating_str = f" (⭐ {rating})" if rating else ""
+                msg += f"### 📍 {name}{rating_str}\n"
+                msg += f"Area: *{district}*\n"
+                msg += f"{desc}\n\n"
+            raw_dict["message_to_user"] = msg
+            
+        elif resp_type == "clarifying":
+            msg = "Untuk membantu menyusun rencana perjalanan terbaik, mohon berikan informasi berikut:\n\n"
+            questions = raw_dict.get("clarifying_questions") or []
+            for q in questions:
+                msg += f"- {q}\n"
+            raw_dict["message_to_user"] = msg
+            
+        else: # chat
+            raw_dict["message_to_user"] = "Halo! Saya Heidi, asisten perjalanan AI Anda untuk Bali. Bagaimana saya bisa membantu perjalanan Anda hari ini?"
+
     # Fix base_hotel description kosong
     if "base_hotel" in raw_dict and isinstance(raw_dict["base_hotel"], dict):
         if not raw_dict["base_hotel"].get("description"):
@@ -1154,8 +1250,34 @@ async def chat_with_heidi(
         if user_id:
             request.state.user_id = str(user_id)
 
+        # --- SESSION PERSISTENCE: load itinerary jika frontend tidak menyertakannya ---
+        # Jika session_id diberikan tapi current_itinerary kosong, coba load dari DB.
+        _session_itinerary: Optional[Dict] = None
+        if req.session_id and not is_editing:
+            try:
+                _session_itinerary = await supabase_service.load_itinerary_session(req.session_id)
+                if _session_itinerary:
+                    is_editing = True
+                    logger.info(
+                        f"Session {req.session_id}: itinerary dimuat dari itinerary_sessions "
+                        f"(response_type={_session_itinerary.get('response_type', '?')})."
+                    )
+            except Exception as _e:
+                logger.warning(f"Gagal load itinerary session ({req.session_id}): {_e}")
+
+        # Gunakan itinerary dari session jika frontend tidak mengirimnya
+        _effective_itinerary = req.current_itinerary or _session_itinerary
+
         # --- KALKULASI POI BUDGET (PRE-AI) ---
-        trip_params = extract_trip_parameters_from_message(req.message)
+        db_districts = await supabase_service.get_db_districts()
+        trip_params = await extract_trip_parameters_from_message(req.message, db_districts)
+        
+        # Cache the extracted locations so that get_smart_recommendations tool hits the cache
+        if trip_params.get("detected_location") and trip_params.get("normalized_districts"):
+            raw_loc = trip_params["detected_location"].lower()
+            supabase_service._normalization_cache[raw_loc] = trip_params["normalized_districts"]
+            for nd in trip_params["normalized_districts"]:
+                supabase_service._normalization_cache[nd.lower()] = trip_params["normalized_districts"]
         # Deteksi jumlah hari dari history / pesan untuk kalkulasi budget
         # Default ke 2 hari; AI yang nanti menentukan secara akurat
         num_days_hint = 2
@@ -1177,7 +1299,7 @@ async def chat_with_heidi(
         preference_mode = _budget_to_mode.get(req.budget_preference, "standard")
 
         # --- BUILD SYSTEM PROMPT ---
-        system_prompt = build_heidi_prompt(req.mode, is_editing, req.current_itinerary, poi_budget, preference_mode)
+        system_prompt = build_heidi_prompt(req.mode, is_editing, _effective_itinerary, poi_budget, preference_mode)
         messages = [{"role": "system", "content": system_prompt}]
         active_session_id = None
 
@@ -1290,7 +1412,7 @@ async def chat_with_heidi(
             try:
                 parsed_data = FinalAIResponse.model_validate_json(raw_text)
             except Exception as e2:
-                logger.error(f"Validasi JSON total gagal: {e2}. raw_text[:500]={raw_text[:500]}")
+                logger.error(f"Validasi JSON total gagal: {e2}. raw_text={raw_text}")
                 raise HTTPException(status_code=500, detail=f"AI menghasilkan format JSON tidak valid: {e2}")
 
         # --- POST-PROCESSING (hanya untuk itinerary) ---
@@ -1303,12 +1425,10 @@ async def chat_with_heidi(
             # 1. HOTEL GUARANTEE — Pastikan base_hotel selalu ada
             parsed_data = await guarantee_base_hotel(parsed_data, district_hint, preference_mode)
 
-            # 2. MEAL INJECTION — Sisipkan restoran ke setiap hari
-            # Lewati jika mode editing untuk menghindari duplikasi
-            if not is_editing:
-                parsed_data = await inject_meals_to_itinerary(
-                    parsed_data, poi_budget, district_hint, preference_mode
-                )
+            # 2. MEAL SCHEDULING — v9.0: Handled by Heidi AI
+            # Restaurants are delivered in the per-day pool from
+            # generate_clustered_pool_delivery. AI places them at
+            # Lunch (12:00-13:30) and Dinner (18:30-20:00).
 
             # 3. ROUTING INJECTION — Backend hitung rute (tidak berubah dari v7)
             hotel = parsed_data.base_hotel
@@ -1398,6 +1518,18 @@ async def chat_with_heidi(
                     parsed_data.itinerary_id = req.itinerary_id
         else:
             logger.info("Guest mode: history dibaca dari frontend dan tidak disimpan.")
+
+        # --- SESSION PERSISTENCE: simpan/perbarui itinerary ke itinerary_sessions ---
+        # Berlaku untuk semua user (guest maupun authenticated) jika session_id disediakan
+        # dan LLM menghasilkan itinerary.
+        if req.session_id and parsed_data.response_type == "itinerary":
+            asyncio.create_task(
+                supabase_service.upsert_itinerary_session(
+                    session_id=req.session_id,
+                    itinerary_data=parsed_data.model_dump(),
+                    user_id=str(user_id) if user_id else None,
+                )
+            )
 
         return parsed_data
 
@@ -1616,7 +1748,7 @@ async def get_place_recommendations(
     current_user=Depends(get_current_user),
 ):
     raw = await supabase_service.search_pois_semantic(query=query, limit=limit * 2)
-    ranked = cluster_and_rank_pois(raw, num_clusters=1, top_n_per_cluster=limit, category=category)
+    ranked = rank_pois_by_topsis(raw, category=category, top_n=limit)
     return {"results": ranked, "count": len(ranked), "query": query}
 
 
@@ -1629,11 +1761,12 @@ async def get_place_recommendations(
 async def health_check(request: Request):
     return {
         "status": "healthy",
-        "version": "8.0",
+        "version": "9.0",
         "service": "SobatNavi AI Agent",
         "features": [
-            "poi_budget_calculator",
-            "meal_injection",
+            "radius_anchor_first_clustering",
+            "topsis_ranking",
+            "ai_meal_scheduling",
             "hotel_guarantee",
             "odalan_safety_check",
             "tomtom_routing",

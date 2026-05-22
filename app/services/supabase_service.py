@@ -47,6 +47,8 @@ ITINERARY_LIST_COLS = (
 class SupabaseService:
     def __init__(self):
         self.client: Client = create_client(settings.supabase_url, settings.supabase_service_key)
+        self._cached_db_districts = None
+        self._normalization_cache = {}
 
     # =========================================================================
     # ODALAN
@@ -73,6 +75,83 @@ class SupabaseService:
     # =========================================================================
     # POI SEARCH
     # =========================================================================
+
+    async def get_db_districts(self) -> list[str]:
+        """Mendapatkan daftar unik district dari database secara dinamis dengan caching."""
+        if self._cached_db_districts is None:
+            try:
+                def _fetch_districts():
+                    return self.client.table("poi_attractions").select("district").execute()
+                res = await asyncio.to_thread(_fetch_districts)
+                self._cached_db_districts = sorted(list(set(
+                    r["district"] for r in res.data if r.get("district")
+                )))
+            except Exception as e:
+                logger.warning(f"Gagal memuat daftar district dari database secara dinamis: {e}.")
+                self._cached_db_districts = []
+        return self._cached_db_districts
+
+    async def _normalize_district_names(self, location: str) -> list[str]:
+        """
+        Memetakan nama sub-distrik/daerah wisata di Bali ke nama-nama distrik
+        yang ada di database secara dinamis menggunakan AI (gpt-4.1-nano)
+        tanpa hardcoded string mapping dan dengan caching.
+        """
+        if not location:
+            return []
+
+        # 1. Cek cache normalisasi
+        loc_clean = location.strip().lower()
+        if loc_clean in self._normalization_cache:
+            logger.info(f"Normalization cache hit untuk '{location}': {self._normalization_cache[loc_clean]}")
+            return self._normalization_cache[loc_clean]
+
+        db_districts = await self.get_db_districts()
+        if not db_districts:
+            return [location]
+
+        # 2. Gunakan gpt-4.1-nano untuk memetakan input 'location' ke db_districts secara cerdas & bertoleransi typo
+        try:
+            oai = _get_openai_client()
+            prompt = (
+                "You are an expert travel assistant for Bali.\n"
+                "Given a user-provided location name (which might have typos, spelling mistakes, or refer to a sub-district, village, beach, landmark, or regency),\n"
+                "map it to all relevant database district/location names from this allowed list:\n"
+                f"{db_districts}\n\n"
+                "Rules:\n"
+                "1. Connect the input to any regencies it belongs to, and any matching beaches, landmarks, or streets in the allowed list.\n"
+                "2. Gracefully handle typos or phonetic spelling variations.\n"
+                "3. Return a JSON object with exactly one key: 'normalized' containing a list of the matching database names.\n"
+                "Return ONLY the raw JSON object. No markdown, no backticks, no explanations."
+            )
+            
+            response = await oai.chat.completions.create(
+                model=settings.openai_model_id,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": f"Location: {location}"}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                max_tokens=150
+            )
+            
+            data = json.loads(response.choices[0].message.content)
+            normalized = data.get("normalized", [])
+            valid_normalized = [d for d in normalized if d in db_districts]
+            if valid_normalized:
+                self._normalization_cache[loc_clean] = valid_normalized
+                return valid_normalized
+
+        except Exception as e:
+            logger.warning(f"Normalisasi district menggunakan AI gagal ({e}). Menggunakan fallback substring matching.")
+
+        # Fallback substring matching
+        matches = [d for d in db_districts if loc_clean in d.lower()]
+        if matches:
+            return matches
+
+        return [location]
 
     @retry_with_backoff(retries=3)
     async def search_pois_semantic(
@@ -110,8 +189,8 @@ class SupabaseService:
 
             rpc_params = {
                 "query_embedding": query_embedding,
-                "match_count": limit,
-                "filter_district": filter_district,
+                "match_count": max(limit * 4, 100) if filter_district else limit,
+                "filter_district": None,  # Matikan filter district di RPC agar bisa difilter di Python
                 "filter_category": filter_category,
                 "filter_price_level": filter_price_level,
                 "filter_min_rating": filter_min_rating,
@@ -122,7 +201,28 @@ class SupabaseService:
 
             result = await asyncio.to_thread(_fetch)
             data = result.data or []
-            logger.info(f"Semantic search '{query}': {len(data)} hasil")
+            
+            if filter_district:
+                normalized_districts = await self._normalize_district_names(filter_district)
+                filtered_data = [
+                    poi for poi in data
+                    if poi.get("district") in normalized_districts
+                ]
+                logger.info(
+                    f"District filter '{filter_district}' mapped to {normalized_districts}. "
+                    f"Filtered {len(data)} results down to {len(filtered_data)}."
+                )
+                if len(filtered_data) >= 3:
+                    data = filtered_data[:limit]
+                else:
+                    logger.warning(
+                        f"Python district filtering for '{filter_district}' yielded only {len(filtered_data)} results. "
+                        f"Falling back to unfiltered global semantic results to prevent empty pool."
+                    )
+                    data = data[:limit]
+            else:
+                logger.info(f"Semantic search '{query}': {len(data)} hasil")
+                
             return data
 
         except Exception as e:
@@ -277,6 +377,101 @@ class SupabaseService:
 
         result = await asyncio.to_thread(_fetch)
         return result.data or []
+
+    async def search_specific_place_nearby(
+        self,
+        query: str,
+        lat: float,
+        lng: float,
+        radius_m: float = 15000,
+    ) -> list[dict]:
+        """
+        Mencari tempat spesifik berdasarkan nama DAN membatasi hasil
+        hanya dalam radius geografis tertentu dari koordinat referensi.
+        Menggunakan RPC search_specific_place_nearby di Supabase.
+        Fallback ke search_specific_place tanpa filter geografi jika RPC gagal.
+        """
+        try:
+            def _fetch():
+                return self.client.rpc("search_specific_place_nearby", {
+                    "search_query": query,
+                    "lat": lat,
+                    "lng": lng,
+                    "radius_m": radius_m,
+                }).execute()
+
+            result = await asyncio.to_thread(_fetch)
+            data = result.data or []
+            logger.info(
+                f"search_specific_place_nearby '{query}' @ ({lat:.4f},{lng:.4f}) "
+                f"radius={radius_m}m → {len(data)} hasil"
+            )
+            return data
+        except Exception as e:
+            logger.warning(
+                f"search_specific_place_nearby RPC gagal ({e}), "
+                "fallback ke search_specific_place tanpa filter geografi."
+            )
+            return await self.search_specific_place(query)
+
+    # =========================================================================
+    # ITINERARY SESSION PERSISTENCE (guest / cross-device)
+    # =========================================================================
+
+    async def load_itinerary_session(self, session_id: str) -> Optional[dict]:
+        """
+        Mengambil itinerary_data dari tabel itinerary_sessions berdasarkan session_id.
+        Mengembalikan dict itinerary_data, atau None jika tidak ditemukan.
+        """
+        try:
+            def _fetch():
+                return (
+                    self.client.table("itinerary_sessions")
+                    .select("itinerary_data")
+                    .eq("session_id", session_id)
+                    .maybe_single()
+                    .execute()
+                )
+
+            result = await asyncio.to_thread(_fetch)
+            row = result.data
+            if row and row.get("itinerary_data"):
+                return row["itinerary_data"]
+            return None
+        except Exception as e:
+            logger.warning(f"load_itinerary_session gagal (session={session_id}): {e}")
+            return None
+
+    async def upsert_itinerary_session(
+        self,
+        session_id: str,
+        itinerary_data: dict,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """
+        Menyimpan (INSERT atau UPDATE) itinerary ke tabel itinerary_sessions.
+        Tidak melempar exception — kegagalan hanya di-log agar tidak merusak flow utama.
+        """
+        try:
+            payload = {
+                "session_id": session_id,
+                "itinerary_data": itinerary_data,
+                "updated_at": "now()",
+            }
+            if user_id:
+                payload["user_id"] = user_id
+
+            def _fetch():
+                return (
+                    self.client.table("itinerary_sessions")
+                    .upsert(payload, on_conflict="session_id")
+                    .execute()
+                )
+
+            await asyncio.to_thread(_fetch)
+            logger.info(f"Itinerary session upserted (session={session_id})")
+        except Exception as e:
+            logger.warning(f"upsert_itinerary_session gagal (session={session_id}): {e}")
 
     @retry_with_backoff(retries=3)
     async def search_inspiration_narrations(self, query: str, limit: int = 3) -> list[dict]:
