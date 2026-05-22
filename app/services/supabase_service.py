@@ -357,26 +357,39 @@ class SupabaseService:
         return result.data or []
 
     async def search_specific_place(self, query: str, category: str = "attraction") -> list[dict]:
-        """Mencari tempat spesifik berdasarkan nama."""
+        """
+        Mencari tempat dengan toleransi typo menggunakan RPC similarity (trigram).
+        """
         table_map = {
             "attraction": "poi_attractions",
             "hotel": "hotel_amenities",
             "restaurant": "culinary_amenities"
         }
         table_name = table_map.get(category, "poi_attractions")
-        select_cols = POI_SELECT_COLS if category == "attraction" else AMENITY_SELECT_COLS
 
-        def _fetch():
-            return (
-                self.client.table(table_name)
-                .select(select_cols)
-                .ilike("name", f"%{query}%")
-                .limit(5)
-                .execute()
-            )
+        try:
+            def _fetch():
+                return self.client.rpc("search_place_by_trigram", {
+                    "search_query": query,
+                    "table_name": table_name,
+                    "result_limit": 5
+                }).execute()
 
-        result = await asyncio.to_thread(_fetch)
-        return result.data or []
+            result = await asyncio.to_thread(_fetch)
+            return result.data or []
+        except Exception as e:
+            logger.warning(f"RPC similarity search gagal, fallback ke ilike: {e}")
+            # Fallback ke ilike jika RPC belum siap atau ada error
+            def _fetch_fallback():
+                return (
+                    self.client.table(table_name)
+                    .select(POI_SELECT_COLS if category == "attraction" else AMENITY_SELECT_COLS)
+                    .ilike("name", f"%{query}%")
+                    .limit(5)
+                    .execute()
+                )
+            result = await asyncio.to_thread(_fetch_fallback)
+            return result.data or []
 
     async def search_specific_place_nearby(
         self,
@@ -758,13 +771,19 @@ class SupabaseService:
         itinerary_data: dict = None,
     ):
         """Menyimpan satu balon pesan (dari user atau dari AI) ke database."""
+        # 1. Bersihkan karakter gaib dari string
+        clean_content = content.replace("\x00", "").replace("\u0000", "") if content else content
+        
         data = {
             "session_id": session_id,
             "role": role,
-            "content": content,
+            "content": clean_content,
         }
+        
         if itinerary_data:
-            data["itinerary"] = itinerary_data
+            # 2. Bersihkan karakter gaib dari JSON
+            clean_json_str = json.dumps(itinerary_data).replace("\x00", "").replace("\u0000", "")
+            data["itinerary"] = json.loads(clean_json_str)
 
         def _fetch():
             return self.client.table("chat_messages").insert(data).execute()
