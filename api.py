@@ -1261,6 +1261,11 @@ async def chat_with_heidi(
 
         # Gunakan itinerary dari session jika frontend tidak mengirimnya
         _effective_itinerary = req.current_itinerary or _session_itinerary
+        
+        # Ekstrak itinerary_id dari state jika frontend tidak mengirimkannya secara eksplisit
+        if not req.itinerary_id and _effective_itinerary:
+            req.itinerary_id = _effective_itinerary.get("itinerary_id")
+            
         is_editing = _effective_itinerary is not None
 
         # --- KALKULASI POI BUDGET (PRE-AI) ---
@@ -1288,8 +1293,8 @@ async def chat_with_heidi(
                 trip_title=None
             )
         
-        # JIKA GAGAL DETEKSI LOKASI & LOKASI PENTING UNTUK ITINERARY
-        if not trip_params["detected_location"] and req.mode == "general":
+        # JIKA GAGAL DETEKSI LOKASI & LOKASI PENTING UNTUK MEMBUAT ITINERARY BARU
+        if not trip_params.get("detected_location") and req.mode == "general" and trip_params.get("intent") == "create" and not is_editing:
             # Berhenti sejenak dan minta klarifikasi
             return {
                 "response_type": "clarifying",
@@ -1448,6 +1453,11 @@ async def chat_with_heidi(
             logger.info(f"District hint terdeteksi: {district_hint}")
 
             # 1. HOTEL GUARANTEE — Pastikan base_hotel selalu ada
+            if is_editing and _effective_itinerary and _effective_itinerary.get("base_hotel") and not parsed_data.base_hotel:
+                from app.schemas.response_schema import BaseHotel
+                parsed_data.base_hotel = BaseHotel(**_effective_itinerary["base_hotel"])
+                logger.info("Hotel dikembalikan dari state sebelumnya karena AI lupa menyertakannya saat edit.")
+
             parsed_data = await guarantee_base_hotel(parsed_data, district_hint, preference_mode)
 
             # 2. MEAL SCHEDULING — v9.0: Handled by Heidi AI

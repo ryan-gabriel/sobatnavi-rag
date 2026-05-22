@@ -487,10 +487,10 @@ class SupabaseService:
             def _fetch():
                 return (
                     self.client.table("user_itineraries")
-                    .select("itinerary_data")
+                    .select("id, itinerary_data")
                     .eq("chat_session_id", chat_session_id)
                     .eq("user_id", user_id)
-                    .order("created_at", descending=True)
+                    .order("created_at", desc=True)
                     .limit(1)
                     .maybe_single()
                     .execute()
@@ -499,7 +499,9 @@ class SupabaseService:
             result = await asyncio.to_thread(_fetch)
             row = result.data
             if row and row.get("itinerary_data"):
-                return row["itinerary_data"]
+                data = row["itinerary_data"]
+                data["itinerary_id"] = row["id"]
+                return data
             return None
         except Exception as e:
             logger.warning(f"get_latest_itinerary_by_session gagal (session={chat_session_id}): {e}")
