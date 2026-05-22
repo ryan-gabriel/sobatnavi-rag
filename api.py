@@ -1251,15 +1251,15 @@ async def chat_with_heidi(
             request.state.user_id = str(user_id)
 
         # --- SESSION PERSISTENCE: load itinerary jika frontend tidak menyertakannya ---
-        # Jika session_id diberikan tapi current_itinerary kosong, coba load dari DB.
+        # Jika session_id diberikan tapi current_itinerary kosong, coba load dari DB (Hanya untuk logged-in user).
         _session_itinerary: Optional[Dict] = None
-        if req.session_id and not is_editing:
+        if is_authenticated and req.session_id and not is_editing:
             try:
-                _session_itinerary = await supabase_service.load_itinerary_session(req.session_id)
+                _session_itinerary = await supabase_service.get_latest_itinerary_by_session(req.session_id, str(user_id))
                 if _session_itinerary:
                     is_editing = True
                     logger.info(
-                        f"Session {req.session_id}: itinerary dimuat dari itinerary_sessions "
+                        f"Session {req.session_id}: itinerary dimuat dari user_itineraries "
                         f"(response_type={_session_itinerary.get('response_type', '?')})."
                     )
             except Exception as _e:
@@ -1518,18 +1518,11 @@ async def chat_with_heidi(
                     parsed_data.itinerary_id = req.itinerary_id
         else:
             logger.info("Guest mode: history dibaca dari frontend dan tidak disimpan.")
+            if hasattr(parsed_data, "session_id"):
+                parsed_data.session_id = req.session_id
+            if hasattr(parsed_data, "itinerary_id"):
+                parsed_data.itinerary_id = req.itinerary_id
 
-        # --- SESSION PERSISTENCE: simpan/perbarui itinerary ke itinerary_sessions ---
-        # Berlaku untuk semua user (guest maupun authenticated) jika session_id disediakan
-        # dan LLM menghasilkan itinerary.
-        if req.session_id and parsed_data.response_type == "itinerary":
-            asyncio.create_task(
-                supabase_service.upsert_itinerary_session(
-                    session_id=req.session_id,
-                    itinerary_data=parsed_data.model_dump(),
-                    user_id=str(user_id) if user_id else None,
-                )
-            )
 
         return parsed_data
 

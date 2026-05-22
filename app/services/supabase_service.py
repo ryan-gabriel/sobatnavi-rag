@@ -414,64 +414,6 @@ class SupabaseService:
             )
             return await self.search_specific_place(query)
 
-    # =========================================================================
-    # ITINERARY SESSION PERSISTENCE (guest / cross-device)
-    # =========================================================================
-
-    async def load_itinerary_session(self, session_id: str) -> Optional[dict]:
-        """
-        Mengambil itinerary_data dari tabel itinerary_sessions berdasarkan session_id.
-        Mengembalikan dict itinerary_data, atau None jika tidak ditemukan.
-        """
-        try:
-            def _fetch():
-                return (
-                    self.client.table("itinerary_sessions")
-                    .select("itinerary_data")
-                    .eq("session_id", session_id)
-                    .maybe_single()
-                    .execute()
-                )
-
-            result = await asyncio.to_thread(_fetch)
-            row = result.data
-            if row and row.get("itinerary_data"):
-                return row["itinerary_data"]
-            return None
-        except Exception as e:
-            logger.warning(f"load_itinerary_session gagal (session={session_id}): {e}")
-            return None
-
-    async def upsert_itinerary_session(
-        self,
-        session_id: str,
-        itinerary_data: dict,
-        user_id: Optional[str] = None,
-    ) -> None:
-        """
-        Menyimpan (INSERT atau UPDATE) itinerary ke tabel itinerary_sessions.
-        Tidak melempar exception — kegagalan hanya di-log agar tidak merusak flow utama.
-        """
-        try:
-            payload = {
-                "session_id": session_id,
-                "itinerary_data": itinerary_data,
-                "updated_at": "now()",
-            }
-            if user_id:
-                payload["user_id"] = user_id
-
-            def _fetch():
-                return (
-                    self.client.table("itinerary_sessions")
-                    .upsert(payload, on_conflict="session_id")
-                    .execute()
-                )
-
-            await asyncio.to_thread(_fetch)
-            logger.info(f"Itinerary session upserted (session={session_id})")
-        except Exception as e:
-            logger.warning(f"upsert_itinerary_session gagal (session={session_id}): {e}")
 
     @retry_with_backoff(retries=3)
     async def search_inspiration_narrations(self, query: str, limit: int = 3) -> list[dict]:
@@ -518,6 +460,37 @@ class SupabaseService:
     # =========================================================================
     # ITINERARY CRUD
     # =========================================================================
+
+    async def get_latest_itinerary_by_session(
+        self,
+        chat_session_id: str,
+        user_id: str,
+    ) -> Optional[dict]:
+        """
+        Mengambil itinerary terakhir untuk chat_session_id tertentu milik user_id.
+        Mengembalikan dict itinerary_data, atau None jika tidak ditemukan.
+        """
+        try:
+            def _fetch():
+                return (
+                    self.client.table("user_itineraries")
+                    .select("itinerary_data")
+                    .eq("chat_session_id", chat_session_id)
+                    .eq("user_id", user_id)
+                    .order("created_at", descending=True)
+                    .limit(1)
+                    .maybe_single()
+                    .execute()
+                )
+
+            result = await asyncio.to_thread(_fetch)
+            row = result.data
+            if row and row.get("itinerary_data"):
+                return row["itinerary_data"]
+            return None
+        except Exception as e:
+            logger.warning(f"get_latest_itinerary_by_session gagal (session={chat_session_id}): {e}")
+            return None
 
     async def save_user_itinerary(
         self,
