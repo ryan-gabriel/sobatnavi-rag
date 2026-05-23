@@ -1993,7 +1993,7 @@ async def chat_with_heidi(
                 skip_llm_loop = True
         
         # JIKA GAGAL DETEKSI LOKASI & LOKASI PENTING UNTUK ITINERARY
-        if not skip_llm_loop and not trip_params["detected_location"] and req.mode == "general":
+        if not skip_llm_loop and not trip_params["detected_location"] and req.mode == "general" and trip_params.get("intent") == "create":
             # Berhenti sejenak dan minta klarifikasi
             return {
                 "response_type": "clarifying",
