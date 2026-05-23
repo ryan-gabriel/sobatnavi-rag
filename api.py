@@ -295,10 +295,12 @@ async def extract_trip_parameters_from_message(message: str, db_districts: list[
         client = _get_client()
         prompt = (
             "Analyze the travel planning message and return a JSON object containing exactly these fields:\n"
-            "- intent: strictly one of 'edit', 'create', or 'chat'.\n"
-            "   * Choose 'edit' if the user explicitly wants to add, delete, replace, or modify places/days.\n"
+            "- intent: strictly one of 'add_place', 'delete_place', 'swap_place', 'create', or 'chat'.\n"
+            "   * Choose 'add_place' if the user explicitly wants to add, insert, or include places/activities.\n"
+            "   * Choose 'delete_place' if the user explicitly wants to delete, remove, or exclude places/activities.\n"
+            "   * Choose 'swap_place' if the user explicitly wants to swap, replace, or exchange one place/day with another.\n"
             "   * Choose 'create' if the user wants to plan a new itinerary.\n"
-            "   * Choose 'chat' for general greetings.\n"
+            "   * Choose 'chat' for general greetings or questions.\n"
             "- pace: string, one of 'santai', 'padat', 'normal'.\n"
             "- is_half_day: boolean, true if half-day trip.\n"
             "- user_requested_pois: integer or null.\n"
@@ -347,15 +349,42 @@ async def extract_trip_parameters_from_message(message: str, db_districts: list[
     # ============================================================
     # 🛡️ JARING PENGAMAN (OVERRIDE MUTLAK)
     # ============================================================
-    # Jika LLM gagal paham, tapi user jelas-jelas bilang "hapus/tambah",
-    # kita paksa intent menjadi "edit".
+    # Jika LLM gagal paham, tapi user jelas-jelas bilang "hapus/tambah/tukar",
+    # kita paksa intent sesuai kata kunci.
     msg_lower = message.lower()
-    if any(k in msg_lower for k in ["hapus", "tambah", "ganti", "ubah", "delete", "remove"]):
-        logger.info(f"Hybrid Override: Kata kunci edit terdeteksi, memaksa intent='edit'")
-        intent = "edit"
+    if any(k in msg_lower for k in ["tukar", "swap", "swapping", "ganti", "replace", "switch"]):
+        logger.info(f"Hybrid Override: Kata kunci swap terdeteksi, memaksa intent='swap_place'")
+        intent = "swap_place"
+    elif any(k in msg_lower for k in ["hapus", "delete", "remove", "keluarkan", "buang"]):
+        logger.info(f"Hybrid Override: Kata kunci hapus terdeteksi, memaksa intent='delete_place'")
+        intent = "delete_place"
+    elif any(k in msg_lower for k in ["tambah", "tambhakan", "tambahkan", "add", "insert", "inject", "masukkan"]):
+        logger.info(f"Hybrid Override: Kata kunci tambah terdeteksi, memaksa intent='add_place'")
+        intent = "add_place"
         
-    if intent not in ["edit", "create", "chat"]:
+    if intent not in ["add_place", "delete_place", "swap_place", "create", "chat"]:
         intent = "chat"
+        
+    # Jaringan pengaman lokasi: Jika LLM gagal mendeteksi lokasi tapi ada nama distrik Bali di pesan
+    if not detected_location:
+        bali_districts = [
+            "ubud", "kuta", "seminyak", "canggu", "sanur", "nusa dua",
+            "jimbaran", "uluwatu", "tabanan", "singaraja", "lovina",
+            "amed", "padangbai", "candidasa", "denpasar", "legian",
+            "nusa penida", "nusa lembongan", "buleleng", "gianyar",
+            "klungkung", "karangasem", "bangli",
+        ]
+        for d in bali_districts:
+            if d in msg_lower:
+                logger.info(f"Hybrid Override: Distrik terdeteksi dari pesan: '{d}'")
+                detected_location = d.title()
+                break
+
+    if detected_location and not valid_districts:
+        det_low = detected_location.lower()
+        matches = [db_d for db_d in db_districts if det_low in db_d.lower() or db_d.lower() in det_low]
+        if matches:
+            valid_districts = matches
     # ============================================================
 
     return {
@@ -366,6 +395,624 @@ async def extract_trip_parameters_from_message(message: str, db_districts: list[
         "detected_location": detected_location,
         "normalized_districts": valid_districts
     }
+
+
+# ============================================================
+# ITINERARY EDIT UTILITIES
+# ============================================================
+
+def add_minutes_to_time(time_str: str, minutes: int) -> str:
+    """Tambahkan durasi menit ke string waktu HH:MM."""
+    try:
+        if not time_str:
+            return "18:00"
+        t = datetime.strptime(time_str, "%H:%M")
+        t_new = t + timedelta(minutes=minutes)
+        return t_new.strftime("%H:%M")
+    except Exception:
+        return "18:00"
+
+
+def calculate_day_centroid(day_places: list, base_hotel: dict = None) -> tuple[float, float]:
+    """Hitung rata-rata koordinat (sentroid) dari daftar tempat pada suatu hari."""
+    coords = []
+    for p in day_places:
+        lat = p.get("latitude")
+        lng = p.get("longitude")
+        if lat is not None and lng is not None:
+            coords.append((float(lat), float(lng)))
+            
+    if coords:
+        lat_avg = sum(c[0] for c in coords) / len(coords)
+        lng_avg = sum(c[1] for c in coords) / len(coords)
+        return lat_avg, lng_avg
+        
+    if base_hotel:
+        h_lat = base_hotel.get("latitude")
+        h_lng = base_hotel.get("longitude")
+        if h_lat is not None and h_lng is not None:
+            return float(h_lat), float(h_lng)
+            
+    return -8.4095, 115.1889  # Default: Bali Tengah
+
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Hitung jarak geografis antara dua titik dalam kilometer menggunakan Haversine."""
+    R = 6371.0  # Radius bumi dalam km
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def recalculate_itinerary_budget(itinerary: dict) -> dict:
+    """Hitung ulang total anggaran dan rincian budget berdasarkan daftar tempat saat ini."""
+    days = itinerary.get("itinerary_days", [])
+    num_days = len(days)
+    
+    # 1. Akomodasi: harga kamar per malam * jumlah hari (asumsi hari = malam)
+    hotel = itinerary.get("base_hotel")
+    hotel_price = 0
+    if hotel:
+        hotel_price = hotel.get("price_per_night_idr") or 0
+    accommodation_idr = hotel_price * max(1, num_days)
+    
+    # 2. Tiket Masuk & Makanan dari tempat-tempat di itinerary
+    entrance_fee_idr = 0
+    food_idr = 0
+    for day in days:
+        places_list = day.get("places") or []
+        for place in places_list:
+            # handle place as dictionary or Pydantic model
+            if hasattr(place, "estimated_cost_idr"):
+                cost = getattr(place, "estimated_cost_idr") or 0
+                cat = getattr(place, "category") or "attraction"
+            else:
+                cost = place.get("estimated_cost_idr") or 0
+                cat = place.get("category") or "attraction"
+                
+            if cat == "restaurant":
+                food_idr += cost
+            else:
+                entrance_fee_idr += cost
+                
+    # 3. Transportasi: default Rp 150.000 per hari
+    transport_idr = 150000 * num_days
+    
+    # 4. Lain-lain: 10% dari total komponen di atas
+    subtotal = accommodation_idr + food_idr + transport_idr + entrance_fee_idr
+    miscellaneous_idr = int(subtotal * 0.1)
+    
+    total_budget_idr = subtotal + miscellaneous_idr
+    
+    itinerary["total_budget_idr"] = total_budget_idr
+    itinerary["budget_breakdown"] = {
+        "accommodation_idr": accommodation_idr,
+        "food_idr": food_idr,
+        "transport_idr": transport_idr,
+        "entrance_fee_idr": entrance_fee_idr,
+        "miscellaneous_idr": miscellaneous_idr
+    }
+    return itinerary
+
+
+async def extract_edit_details(message: str, itinerary: dict) -> dict:
+    """Menggunakan LLM untuk mengekstrak tempat-tempat yang ingin ditambahkan."""
+    client = _get_client()
+    days_summary = []
+    for day in itinerary.get("itinerary_days", []):
+        place_names = []
+        for p in day.get("places", []):
+            if hasattr(p, "name"):
+                place_names.append(getattr(p, "name"))
+            elif isinstance(p, dict):
+                place_names.append(p.get("name"))
+        days_summary.append(f"Day {day.get('day')}: {', '.join(place_names)}")
+    itinerary_context = "\n".join(days_summary)
+
+    prompt = (
+        "Analyze the user's travel planning request to add places to their itinerary.\n"
+        f"Here is the current itinerary:\n{itinerary_context}\n\n"
+        "Extract the places the user wants to add. For each place, determine:\n"
+        "1. 'query': The place name, type, or description to search for (e.g. 'Tegenungan Waterfall', 'air terjun', 'mall', 'apa aja').\n"
+        "2. 'is_specific': Boolean. True if it's a specific named place (like 'Tanah Lot', 'Waterbom Bali', 'Pura Ulun Danu Beratan'). False if it's a generic description, type, category, or vibe (like 'air terjun', 'mall', 'pantai sunset', 'tempat apa aja').\n"
+        "3. 'day': Integer (1-based index). The day to add it to. If the user does not specify a day or it is ambiguous/not mentioned, set it to null.\n"
+        "4. 'count': Integer. The number of places of this type to add. Defaults to 1 if not specified.\n\n"
+        "Format the response as a JSON object with this schema:\n"
+        "{\n"
+        "  \"items\": [\n"
+        "    {\n"
+        "      \"query\": \"string\",\n"
+        "      \"is_specific\": boolean,\n"
+        "      \"day\": integer or null,\n"
+        "      \"count\": integer\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Return ONLY the raw JSON object."
+    )
+
+    response = await client.chat.completions.create(
+        model=settings.openai_model_id,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": message}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.0,
+    )
+    try:
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"Failed to parse extract_edit_details JSON: {e}")
+        return {"items": []}
+
+
+async def pinpoint_places_to_delete(message: str, itinerary: dict) -> dict:
+    """Menggunakan LLM untuk mengidentifikasi indeks tempat yang ingin dihapus."""
+    client = _get_client()
+    places_list = []
+    for day in itinerary.get("itinerary_days", []):
+        day_num = day.get("day")
+        places_in_day = day.get("places") or []
+        for idx, p in enumerate(places_in_day):
+            if hasattr(p, "name"):
+                name = getattr(p, "name")
+                category = getattr(p, "category", "")
+                description = getattr(p, "description", "")
+                place_id = getattr(p, "place_id", "")
+            else:
+                name = p.get("name")
+                category = p.get("category", "")
+                description = p.get("description", "")
+                place_id = p.get("place_id", "")
+
+            places_list.append({
+                "day": day_num,
+                "index": idx,
+                "place_id": place_id,
+                "name": name,
+                "category": category,
+                "description": description
+            })
+
+    prompt = (
+        "You are an expert travel assistant. The user wants to delete a place or multiple places from their itinerary.\n"
+        f"User message: '{message}'\n\n"
+        f"Here is the list of places currently in the itinerary:\n{json.dumps(places_list, indent=2)}\n\n"
+        "Identify which place(s) the user wants to delete based on their message. "
+        "Return the day and index of each place to delete.\n"
+        "Format the response as a JSON object with this schema:\n"
+        "{\n"
+        "  \"delete_indices\": [\n"
+        "    {\n"
+        "      \"day\": integer,\n"
+        "      \"index\": integer\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "If no place matches the user's request, return an empty list for 'delete_indices'.\n"
+        "Return ONLY the raw JSON object."
+    )
+
+    response = await client.chat.completions.create(
+        model=settings.openai_model_id,
+        messages=[
+            {"role": "system", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.0,
+    )
+    try:
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"Failed to parse pinpoint_places_to_delete JSON: {e}")
+        return {"delete_indices": []}
+
+
+async def generate_edit_confirmation_message(
+    message: str,
+    original_itinerary: dict,
+    modified_itinerary: dict,
+    change_summary: str
+) -> dict:
+    """Menggunakan LLM untuk menghasilkan narasi konfirmasi perubahan itinerary yang ramah dan alami."""
+    client = _get_client()
+    prompt = (
+        "You are Heidi, the AI travel assistant for Bali.\n"
+        "The user asked to edit their itinerary. The edit was successfully executed.\n"
+        f"User edit request: '{message}'\n"
+        f"Summary of changes made: {change_summary}\n\n"
+        "Please write a warm, friendly response message (in Indonesian) to the user confirming the change. "
+        "Briefly explain what was added or deleted and why, and confirm their itinerary has been updated. "
+        "Always use rich markdown formatting (bold, italic, headings, lists, emojis).\n\n"
+        "Return a JSON object with two fields:\n"
+        "- 'message_to_user': The markdown message confirming the changes.\n"
+        "- 'suggested_replies': A list of 3 relevant follow-up questions/suggestions (e.g. asking to adjust times, add more places, check route, etc.).\n"
+        "Return ONLY the raw JSON object."
+    )
+    
+    response = await client.chat.completions.create(
+        model=settings.openai_model_id,
+        messages=[
+            {"role": "system", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.7,
+    )
+    try:
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"Failed to parse generate_edit_confirmation_message JSON: {e}")
+        return {
+            "message_to_user": f"Jadwal kamu telah diperbarui: {change_summary}",
+            "suggested_replies": ["Tampilkan rute terbaru", "Sesuaikan waktu kunjungan", "Saran tempat lainnya"]
+        }
+
+
+async def execute_itinerary_edit(message: str, itinerary: dict, intent: str) -> FinalAIResponse:
+    import copy
+    
+    # 1. Clone itinerary to ensure immutability
+    edited_itinerary = copy.deepcopy(itinerary)
+    itinerary_days = edited_itinerary.get("itinerary_days", [])
+    if not itinerary_days:
+        return FinalAIResponse(
+            response_type="chat",
+            message_to_user="Maaf, itinerary Anda kosong atau tidak valid.",
+            suggested_replies=["Buatkan itinerary 3 hari"],
+            itinerary_days=None,
+            base_hotel=None,
+            trip_title=None
+        )
+        
+    change_summary_parts = []
+    
+    # ==========================================
+    # FLOW: ADD PLACE
+    # ==========================================
+    if intent == "add_place":
+        extracted = await extract_edit_details(message, itinerary)
+        items_to_add = extracted.get("items", [])
+        if not items_to_add:
+            return FinalAIResponse(
+                response_type="chat",
+                message_to_user="Aku tidak mengerti tempat apa yang ingin kamu tambahkan. Bisa tolong sebutkan secara jelas? 😊",
+                suggested_replies=["Tambahkan Pantai Pandawa", "Tambahkan air terjun di Hari 1"],
+                itinerary_days=None,
+                base_hotel=None,
+                trip_title=None
+            )
+            
+        # 1. Edge Case: Check if any item does not specify a day
+        for item in items_to_add:
+            if item.get("day") is None:
+                q = item.get("query", "tempat")
+                return FinalAIResponse(
+                    response_type="chat",
+                    message_to_user=f"Di hari ke berapa kamu ingin menambahkan '{q}'? Silakan sebutkan nomor hari (misalnya: Hari 1) agar aku bisa menempatkannya dengan tepat. 😊",
+                    suggested_replies=[f"Tambahkan di Hari 1", f"Tambahkan di Hari 2"],
+                    itinerary_days=None,
+                    base_hotel=None,
+                    trip_title=None
+                )
+                
+        # Existing place IDs/names for duplication filtering
+        existing_place_ids = set()
+        for day in itinerary_days:
+            for place in day.get("places", []):
+                pid = place.get("place_id")
+                if pid:
+                    existing_place_ids.add(pid)
+                name = place.get("name")
+                if name:
+                    existing_place_ids.add(name.lower())
+                    
+        # Process additions
+        for item in items_to_add:
+            query = item.get("query")
+            is_specific = item.get("is_specific", False)
+            day_num = item.get("day")
+            count = max(1, min(item.get("count", 1), 5)) # Clamp count
+            
+            # Find the corresponding day object
+            day_obj = next((d for d in itinerary_days if d.get("day") == day_num), None)
+            if not day_obj:
+                return FinalAIResponse(
+                    response_type="chat",
+                    message_to_user=f"Maaf, Hari {day_num} tidak ada dalam itinerary kamu saat ini.",
+                    suggested_replies=["Tampilkan itinerary", "Tambahkan tempat di Hari 1"],
+                    itinerary_days=None,
+                    base_hotel=None,
+                    trip_title=None
+                )
+                
+            # Get centroid coordinates for the day
+            centroid_lat, centroid_lng = calculate_day_centroid(day_obj.get("places", []), edited_itinerary.get("base_hotel"))
+            
+            # Sub-flow: Specific Place
+            if is_specific:
+                results = await supabase_service.search_specific_place(query, category="attraction")
+                if not results:
+                    results = await supabase_service.search_specific_place(query, category="restaurant")
+                    
+                if not results:
+                    return FinalAIResponse(
+                        response_type="chat",
+                        message_to_user=f"Maaf, tempat '{query}' tidak ditemukan di database kami. Kamu bisa mencoba mencari tempat lain, atau memasukkannya secara manual.",
+                        suggested_replies=["Cari alternatif lainnya", "Tambahkan tempat lain"],
+                        itinerary_days=None,
+                        base_hotel=None,
+                        trip_title=None
+                    )
+                    
+                # Pick the first result as the best match
+                place_data = results[0]
+                place_id = place_data.get("place_id")
+                
+                # Check for duplication
+                if place_id in existing_place_ids or place_data.get("name", "").lower() in existing_place_ids:
+                    return FinalAIResponse(
+                        response_type="chat",
+                        message_to_user=f"Tempat '{place_data.get('name')}' sudah ada dalam itinerary kamu.",
+                        suggested_replies=["Tambahkan tempat lain", "Lihat itinerary"],
+                        itinerary_days=None,
+                        base_hotel=None,
+                        trip_title=None
+                    )
+                    
+                is_resto = "price_level" in place_data or place_data.get("category") == "restaurant"
+                cat_canonical = "restaurant" if is_resto else "attraction"
+                
+                # Build PlaceItem
+                new_place = {
+                    "place_id": place_id,
+                    "poi_id": str(place_data.get("id")) if place_data.get("id") else None,
+                    "name": place_data.get("name"),
+                    "category": cat_canonical,
+                    "description": place_data.get("content") or f"Kunjungan menarik ke {place_data.get('name')}.",
+                    "latitude": place_data.get("latitude"),
+                    "longitude": place_data.get("longitude"),
+                    "district": place_data.get("district"),
+                    "image_url": place_data.get("image_url"),
+                    "rating": place_data.get("rating"),
+                    "user_rating_count": place_data.get("user_rating_count"),
+                    "estimated_cost_idr": 75000 if is_resto else 25000,
+                    "tags": ["wisata", "bali"],
+                    "visit_duration_mins": 60 if is_resto else 75,
+                    "visit_time": None,
+                    "tips": f"Selamat menikmati perjalanan Anda di {place_data.get('name')}."
+                }
+                
+                # Calculate visit time
+                places_in_day = day_obj.get("places", [])
+                if places_in_day:
+                    last_p = places_in_day[-1]
+                    # handle dictionary vs Pydantic object
+                    last_visit_time = last_p.get("visit_time") if isinstance(last_p, dict) else getattr(last_p, "visit_time")
+                    last_duration = last_p.get("visit_duration_mins") if isinstance(last_p, dict) else getattr(last_p, "visit_duration_mins")
+                    new_place["visit_time"] = add_minutes_to_time(last_visit_time, (last_duration or 60) + 30)
+                else:
+                    new_place["visit_time"] = "08:00"
+                    
+                day_obj["places"].append(new_place)
+                existing_place_ids.add(place_id)
+                change_summary_parts.append(f"menambahkan '{place_data.get('name')}' di Hari {day_num}")
+                
+            # Sub-flow: Generic Place (e.g. "air terjun", "mall", or "apa aja")
+            else:
+                is_generic_random = query.strip().lower() in ["apa aja", "apa saja", "mana aja", "bebas", "random", "tempat apa aja", "terserah", "whatever", "tempat apa saja"]
+                
+                added_count = 0
+                if is_generic_random:
+                    nearby_results = await supabase_service.search_pois_nearby(centroid_lat, centroid_lng, radius_m=20000, limit=20)
+                    valid_nearby = []
+                    for r in nearby_results:
+                        pid = r.get("place_id")
+                        name = r.get("name", "").lower()
+                        if pid not in existing_place_ids and name not in existing_place_ids:
+                            valid_nearby.append(r)
+                            
+                    for i in range(min(count, len(valid_nearby))):
+                        place_data = valid_nearby[i]
+                        place_id = place_data.get("place_id")
+                        new_place = {
+                            "place_id": place_id,
+                            "poi_id": str(place_data.get("id")) if place_data.get("id") else None,
+                            "name": place_data.get("name"),
+                            "category": "attraction",
+                            "description": place_data.get("content") or f"Menikmati suasana indah di {place_data.get('name')}.",
+                            "latitude": place_data.get("latitude"),
+                            "longitude": place_data.get("longitude"),
+                            "district": place_data.get("district"),
+                            "image_url": place_data.get("image_url"),
+                            "rating": place_data.get("rating"),
+                            "user_rating_count": place_data.get("user_rating_count"),
+                            "estimated_cost_idr": 25000,
+                            "tags": ["wisata", "bali"],
+                            "visit_duration_mins": 75,
+                            "visit_time": None,
+                            "tips": "Nikmati keindahan tempat wisata terdekat ini."
+                        }
+                        
+                        places_in_day = day_obj.get("places", [])
+                        if places_in_day:
+                            last_p = places_in_day[-1]
+                            last_visit_time = last_p.get("visit_time") if isinstance(last_p, dict) else getattr(last_p, "visit_time")
+                            last_duration = last_p.get("visit_duration_mins") if isinstance(last_p, dict) else getattr(last_p, "visit_duration_mins")
+                            new_place["visit_time"] = add_minutes_to_time(last_visit_time, (last_duration or 60) + 30)
+                        else:
+                            new_place["visit_time"] = "08:00"
+                            
+                        day_obj["places"].append(new_place)
+                        existing_place_ids.add(place_id)
+                        added_count += 1
+                        change_summary_parts.append(f"menambahkan '{place_data.get('name')}' di Hari {day_num}")
+                else:
+                    semantic_results = await supabase_service.search_pois_semantic(query, limit=50)
+                    if not semantic_results:
+                        return FinalAIResponse(
+                            response_type="chat",
+                            message_to_user=f"Maaf, tidak ditemukan tempat wisata yang cocok untuk pencarian '{query}' di database.",
+                            suggested_replies=["Coba kata kunci lain", "Tambahkan tempat lain"],
+                            itinerary_days=None,
+                            base_hotel=None,
+                            trip_title=None
+                        )
+                        
+                    sorted_results = []
+                    for r in semantic_results:
+                        r_lat = r.get("latitude")
+                        r_lng = r.get("longitude")
+                        if r_lat is not None and r_lng is not None:
+                            dist = haversine_distance(centroid_lat, centroid_lng, float(r_lat), float(r_lng))
+                            sorted_results.append((dist, r))
+                            
+                    sorted_results.sort(key=lambda x: x[0])
+                    
+                    valid_semantic = []
+                    for dist, r in sorted_results:
+                        pid = r.get("place_id")
+                        name = r.get("name", "").lower()
+                        if pid not in existing_place_ids and name not in existing_place_ids:
+                            valid_semantic.append(r)
+                            
+                    if not valid_semantic:
+                        return FinalAIResponse(
+                            response_type="chat",
+                            message_to_user=f"Maaf, semua tempat wisata '{query}' terdekat sudah ada di itinerary kamu.",
+                            suggested_replies=["Tambahkan kategori lain", "Lihat itinerary"],
+                            itinerary_days=None,
+                            base_hotel=None,
+                            trip_title=None
+                        )
+                        
+                    for i in range(min(count, len(valid_semantic))):
+                        place_data = valid_semantic[i]
+                        place_id = place_data.get("place_id")
+                        new_place = {
+                            "place_id": place_id,
+                            "poi_id": str(place_data.get("id")) if place_data.get("id") else None,
+                            "name": place_data.get("name"),
+                            "category": "attraction",
+                            "description": place_data.get("content") or f"Menjelajahi keindahan {place_data.get('name')}.",
+                            "latitude": place_data.get("latitude"),
+                            "longitude": place_data.get("longitude"),
+                            "district": place_data.get("district"),
+                            "image_url": place_data.get("image_url"),
+                            "rating": place_data.get("rating"),
+                            "user_rating_count": place_data.get("user_rating_count"),
+                            "estimated_cost_idr": 25000,
+                            "tags": ["wisata", "bali"],
+                            "visit_duration_mins": 75,
+                            "visit_time": None,
+                            "tips": "Jangan lupa siapkan kamera untuk mengambil momen indah."
+                        }
+                        
+                        places_in_day = day_obj.get("places", [])
+                        if places_in_day:
+                            last_p = places_in_day[-1]
+                            last_visit_time = last_p.get("visit_time") if isinstance(last_p, dict) else getattr(last_p, "visit_time")
+                            last_duration = last_p.get("visit_duration_mins") if isinstance(last_p, dict) else getattr(last_p, "visit_duration_mins")
+                            new_place["visit_time"] = add_minutes_to_time(last_visit_time, (last_duration or 60) + 30)
+                        else:
+                            new_place["visit_time"] = "08:00"
+                            
+                        day_obj["places"].append(new_place)
+                        existing_place_ids.add(place_id)
+                        added_count += 1
+                        change_summary_parts.append(f"menambahkan '{place_data.get('name')}' di Hari {day_num}")
+                        
+                if added_count == 0:
+                    return FinalAIResponse(
+                        response_type="chat",
+                        message_to_user="Maaf, kami tidak berhasil menemukan tempat terdekat yang cocok untuk ditambahkan.",
+                        suggested_replies=["Ubah kata kunci pencarian", "Lihat itinerary"],
+                        itinerary_days=None,
+                        base_hotel=None,
+                        trip_title=None
+                    )
+
+    # ==========================================
+    # FLOW: DELETE PLACE
+    # ==========================================
+    elif intent == "delete_place":
+        pinpoint_result = await pinpoint_places_to_delete(message, itinerary)
+        delete_indices = pinpoint_result.get("delete_indices", [])
+        if not delete_indices:
+            return FinalAIResponse(
+                response_type="chat",
+                message_to_user="Maaf, aku tidak menemukan tempat yang ingin kamu hapus di itinerary. Kamu bisa menghapusnya secara manual melalui editor. 😊",
+                suggested_replies=["Hapus tempat lain", "Tampilkan itinerary"],
+                itinerary_days=None,
+                base_hotel=None,
+                trip_title=None
+            )
+            
+        deletes_by_day = {}
+        for item in delete_indices:
+            d = item.get("day")
+            idx = item.get("index")
+            if d not in deletes_by_day:
+                deletes_by_day[d] = []
+            deletes_by_day[d].append(idx)
+            
+        for d, idxs in deletes_by_day.items():
+            day_obj = next((day for day in itinerary_days if day.get("day") == d), None)
+            if day_obj and "places" in day_obj:
+                for idx in sorted(idxs, reverse=True):
+                    if 0 <= idx < len(day_obj["places"]):
+                        p = day_obj["places"][idx]
+                        p_name = p.get("name") if isinstance(p, dict) else getattr(p, "name", "Tempat")
+                        day_obj["places"].pop(idx)
+                        change_summary_parts.append(f"menghapus '{p_name}' di Hari {d}")
+                        
+        if not change_summary_parts:
+            return FinalAIResponse(
+                response_type="chat",
+                message_to_user="Maaf, aku tidak menemukan tempat yang ingin kamu hapus di itinerary. Kamu bisa menghapusnya secara manual.",
+                suggested_replies=["Tampilkan itinerary"],
+                itinerary_days=None,
+                base_hotel=None,
+                trip_title=None
+            )
+
+    # 3. Recalculate routes fields as null so that backend TomTom routing runs
+    for day in itinerary_days:
+        day["day_total_distance_km"] = None
+        day["day_total_travel_time_mins"] = None
+        day["day_full_polyline"] = None
+        day["route_from_hotel"] = None
+        for p in day.get("places", []):
+            if isinstance(p, dict):
+                p["route_to_next"] = None
+            else:
+                setattr(p, "route_to_next", None)
+                
+    # 4. Recalculate budget
+    edited_itinerary = recalculate_itinerary_budget(edited_itinerary)
+    
+    # 5. Generate confirmation narrative
+    change_summary = ", ".join(change_summary_parts)
+    confirmation = await generate_edit_confirmation_message(message, itinerary, edited_itinerary, change_summary)
+    
+    # 6. Parse into FinalAIResponse
+    response_dict = {
+        "response_type": "itinerary",
+        "message_to_user": confirmation.get("message_to_user", f"Jadwal kamu telah diperbarui: {change_summary}."),
+        "suggested_replies": confirmation.get("suggested_replies", ["Tampilkan rute terbaru", "Sesuaikan waktu kunjungan"]),
+        "trip_title": edited_itinerary.get("trip_title"),
+        "base_hotel": edited_itinerary.get("base_hotel"),
+        "itinerary_days": edited_itinerary.get("itinerary_days"),
+        "total_budget_idr": edited_itinerary.get("total_budget_idr"),
+        "budget_breakdown": edited_itinerary.get("budget_breakdown"),
+        "itinerary_id": edited_itinerary.get("itinerary_id")
+    }
+    
+    return FinalAIResponse.model_validate(response_dict)
 
 
 # ============================================================
@@ -809,9 +1456,10 @@ STEP 1 → Analisis pesan user: Apakah meminta HAPUS (Delete) atau TAMBAH (Add)?
 STEP 2 → JIKA USER MINTA HAPUS: Cukup hilangkan objek tempat tersebut dari array `places` pada hari yang dimaksud. JANGAN panggil tool pencarian global atau nearby apa pun! Cukup eliminasi item dari array JSON yang sudah ada.
 STEP 3 → JIKA USER MINTA TAMBAH TEMPAT SPESIFIK: Kamu WAJIB memanggil tool `search_specific_place_nearby`. Untuk parameter `lat` dan `lng`, kamu WAJIB mengambil koordinat dari salah satu tempat wisata (POI) yang SUDAH ADA di dalam array hari tersebut. Ini untuk memastikan tempat baru dikunci dalam radius berdekatan (~15km) dan tidak membuat rute hari itu melompat jauh.
 STEP 4 → JIKA USER MINTA TAMBAH TEMPAT SECARA UMUM/GENERIK: Kamu WAJIB memanggil `get_smart_recommendations` atau `get_nearby_places`. DILARANG KERAS bertanya kembali kepada user atau menawarkan pilihan! Pilih 1 tempat terbaik yang paling relevan dengan tema yang diminta (misal: "air terjun di Bangli"), masukkan tempat tersebut ke dalam itinerary, dan langsung konfirmasi perubahannya di `message_to_user`. Tugasmu adalah eksekusi, bukan berdiskusi.
-STEP 5 → IMMUTABLE CLONING (MANDATORY): Untuk hari-hari (Day) atau data lain yang TIDAK diminta untuk diubah oleh user, kamu WAJIB menyalin (clone) seluruh strukturnya secara persis 100% tanpa mengubah data, urutan jam, nama, atau narasinya sedikit pun!
-STEP 6 → LARANGAN ROUTING: Biarkan semua field rute harian (`route_to_next`, `day_full_polyline`, `day_total_distance_km`, `day_total_travel_time_mins`) selalu bernilai `null` karena backend TomTom yang akan menghitung ulang jalurnya secara otomatis setelah JSON divalidasi.
-STEP 7 → Tulis narasi konfirmasi hangat di `message_to_user` dan kembalikan struktur JSON penuh. Pastikan `response_type` tetap `"itinerary"`.
+STEP 5 → IMMUTABLE CLONING (MANDATORY): Untuk hari-hari (Day) atau data lain yang TIDAK diminta untuk diubah oleh user, kamu WAJIB menyalin (clone) seluruh strukturnya secara persis 100%, termasuk `latitude`, `longitude`, `place_id`, `name`, dan semua field lainnya. JANGAN mengubah, menghapus, atau mempersingkat data apapun yang tidak diminta user.
+STEP 6 → KOORDINAT WAJIB DIJAGA: Setiap PlaceItem di semua hari HARUS memiliki `latitude` dan `longitude` yang tidak null. Saat cloning, pastikan kamu menyalin nilai numerik koordinat persis seperti yang ada di `current_itinerary` yang diberikan.
+STEP 7 → LARANGAN ROUTING: Biarkan semua field rute harian (`route_to_next`, `day_full_polyline`, `day_total_distance_km`, `day_total_travel_time_mins`) selalu bernilai `null` karena backend TomTom yang akan menghitung ulang jalurnya secara otomatis setelah JSON divalidasi.
+STEP 8 → Tulis narasi konfirmasi hangat di `message_to_user` dan kembalikan struktur JSON penuh. Pastikan `response_type` tetap `"itinerary"`.
 ATURAN KRITIKAL: DILARANG KERAS menggunakan frasa seperti "Tunggu sebentar", "Sedang diproses", atau "Aku akan segera kirimkan". Langsung berikan konfirmasi tegas bahwa jadwal SUDAH berhasil diperbarui!
 """
     else:
@@ -847,14 +1495,39 @@ Hari ini: {today_str}. Asumsi keberangkatan jika tidak disebutkan: besok ({tomor
 3. **ANTI-HALUSINASI**: DILARANG mengarang nama tempat, place_id, latitude, longitude. Semua dari Tool.
 4. **SATU HOTEL**: Pilih SATU `base_hotel` untuk SEMUA hari. Hotel TIDAK BOLEH muncul di dalam `places` harian.
 5. **LARANGAN ROUTING**: JANGAN isi field rute apapun. `route_to_next`, `day_full_polyline`, `day_total_distance_km`, `day_total_travel_time_mins` WAJIB null.
-6. **DATA WAJIB DI SETIAP PlaceItem (TIDAK BOLEH NULL)**:
-   - `rating` & `district`: Dari data tool.
+6. **DATA WAJIB DI SETIAP PlaceItem (SEMUA HARUS DIISI, TIDAK BOLEH NULL)**:
+   - `place_id`: Dari field `place_id` hasil tool. WAJIB DIISI agar koordinat bisa di-lookup.
+   - `latitude` & `longitude`: WAJIB dari field `latitude`/`longitude` hasil tool. COPY PERSIS, JANGAN dikira-kira.
+   - `name`: Dari field `name` hasil tool.
+   - `district`: Dari field `district` hasil tool.
+   - `rating`: Dari field `rating` hasil tool.
+   - `description`: Dari field `content` hasil tool.
+   - `image_url`: Dari field `image_url` hasil tool.
    - `tags`: 3-5 label dari deskripsi. WAJIB DIISI.
    - `estimated_cost_idr`: Estimasi biaya per orang (pura ~15000, pantai ~25000, museum ~50000, makan ~75000). WAJIB DIISI.
    - `visit_duration_mins`: Durasi estimasi (pura kecil=45, pantai=75, museum=90, restoran=50). WAJIB DIISI.
    - `visit_time`: HH:MM 24-jam sesuai urutan (pagi mulai 08:00). WAJIB DIISI.
    - `tips`: Satu kalimat tip berguna. WAJIB DIISI.
-   - `image_url`: Dari tool jika ada.
+
+## PETA DATA TOOL → PLACEITEM (WAJIB IKUTI)
+Saat `get_smart_recommendations(category='poi')` dipanggil, responnya berstruktur:
+```
+[
+  {{"day": 1, "anchor": {{"lat": -8.5, "lng": 115.1}}, "pois": [POI_OBJECT, ...], "restaurants": [RESTO_OBJECT, ...]}},
+  ...
+]
+```
+Untuk setiap POI_OBJECT atau RESTO_OBJECT, petakan ke PlaceItem PERSIS sebagai berikut:
+- `place_id`  ← `poi.place_id`
+- `name`      ← `poi.name`
+- `latitude`  ← `poi.latitude`   ← **WAJIB COPY, jangan null!**
+- `longitude` ← `poi.longitude`  ← **WAJIB COPY, jangan null!**
+- `district`  ← `poi.district`
+- `rating`    ← `poi.rating`
+- `description` ← `poi.content`
+- `image_url` ← `poi.image_url`
+- `category`  ← "attraction" untuk POI, "restaurant" untuk restoran
+
 7. **HARI WAJIB SESUAI PERMINTAAN (CRITICAL)**:
    Jika user meminta N hari, kamu WAJIB menghasilkan TEPAT N objek `day` di dalam `itinerary_days`.
    DILARANG KERAS mengurangi jumlah hari. Jika pool POI kurang, variasikan query ke tool.
@@ -1026,8 +1699,100 @@ async def guarantee_base_hotel(
 
 
 # ============================================================
-# EXTRACT DISTRICT HINT dari raw text / itinerary
+# COORDINATE ENRICHMENT (Backend Safety Net)
 # ============================================================
+
+async def enrich_place_coordinates(parsed_data: "FinalAIResponse") -> "FinalAIResponse":
+    """
+    Safety net: jika AI lupa mengisi latitude/longitude pada PlaceItem,
+    backend akan mencarinya secara otomatis menggunakan place_id.
+
+    Strategi:
+    1. Kumpulkan semua place_id dari tempat yang lat/lng-nya null
+    2. Batch-query ke poi_attractions, hotel_amenities, culinary_amenities
+    3. Injeksi koordinat yang ditemukan kembali ke PlaceItem
+    """
+    if not parsed_data.itinerary_days:
+        return parsed_data
+
+    # Kumpulkan place_id yang koordinatnya null
+    missing_ids: set[str] = set()
+    for day in parsed_data.itinerary_days:
+        for place in (day.places or []):
+            if place.place_id and (place.latitude is None or place.longitude is None):
+                missing_ids.add(place.place_id)
+
+    # Cek juga base_hotel
+    hotel = parsed_data.base_hotel
+    hotel_needs_coords = (
+        hotel is not None
+        and hotel.place_id
+        and (hotel.latitude is None or hotel.longitude is None)
+    )
+    if hotel_needs_coords:
+        missing_ids.add(hotel.place_id)
+
+    if not missing_ids:
+        return parsed_data
+
+    logger.info(f"Coordinate enrichment: {len(missing_ids)} place_id butuh koordinat: {list(missing_ids)[:5]}")
+
+    # Batch-lookup dari semua tabel relevan
+    coord_map: dict[str, dict] = {}
+    tables = [
+        ("poi_attractions", "place_id, name, latitude, longitude"),
+        ("hotel_amenities", "place_id, name, latitude, longitude"),
+        ("culinary_amenities", "place_id, name, latitude, longitude"),
+    ]
+
+    missing_list = list(missing_ids)
+    for table_name, cols in tables:
+        if not missing_list:
+            break
+        try:
+            def _make_fetch(tbl, c, ids):
+                def _fetch():
+                    return (
+                        supabase_service.client.table(tbl)
+                        .select(c)
+                        .in_("place_id", ids)
+                        .execute()
+                    )
+                return _fetch
+
+            result = await asyncio.to_thread(_make_fetch(table_name, cols, missing_list))
+            for row in (result.data or []):
+                pid = row.get("place_id")
+                lat = row.get("latitude")
+                lng = row.get("longitude")
+                if pid and lat is not None and lng is not None:
+                    coord_map[pid] = {"latitude": lat, "longitude": lng}
+        except Exception as e:
+            logger.warning(f"Coordinate enrichment: query '{table_name}' gagal: {e}")
+
+    if not coord_map:
+        logger.warning("Coordinate enrichment: tidak menemukan koordinat dari database.")
+        return parsed_data
+
+    injected = 0
+    for day in parsed_data.itinerary_days:
+        for place in (day.places or []):
+            if place.place_id and place.place_id in coord_map:
+                if place.latitude is None:
+                    place.latitude = coord_map[place.place_id]["latitude"]
+                    injected += 1
+                if place.longitude is None:
+                    place.longitude = coord_map[place.place_id]["longitude"]
+
+    if hotel_needs_coords and hotel.place_id in coord_map:
+        hotel.latitude = coord_map[hotel.place_id]["latitude"]
+        hotel.longitude = coord_map[hotel.place_id]["longitude"]
+        injected += 1
+
+    logger.info(f"Coordinate enrichment selesai: {injected} place diinjeksi koordinatnya.")
+    return parsed_data
+
+
 
 def extract_district_hint(raw_text: str, message: str) -> str:
     """
@@ -1213,9 +1978,118 @@ def sanitize_ai_output(raw_dict: dict) -> dict:
     return raw_dict
 
 
-# ============================================================
-# MAIN CHAT ENDPOINT
-# ============================================================
+async def repair_empty_places(
+    raw_dict: dict,
+    messages_history: list,
+) -> dict:
+    """
+    Targeted repair: AI mengembalikan itinerary dengan places:[],
+    tapi narasi di message_to_user sudah benar.
+
+    Strategy:
+    1. Ambil narasi dari message_to_user + tool results dari history
+    2. Kirim ke LLM dengan instruksi ketat untuk mengisi places saja
+    3. Merge hasilnya ke raw_dict
+    """
+    logger.warning("REPAIR: Semua places kosong! Menjalankan repair_empty_places...")
+
+    # Kumpulkan tool results dari history (data POI yang sudah di-fetch sebelumnya)
+    tool_data_parts = []
+    for msg in messages_history:
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            content = msg.get("content", "")
+            tool_name = msg.get("name", "")
+            if tool_name in ("get_smart_recommendations", "search_specific_place", "get_nearby_places"):
+                tool_data_parts.append(f"[{tool_name} result]:\n{content[:3000]}")
+
+    tool_data_str = "\n\n".join(tool_data_parts) if tool_data_parts else "(Tidak ada data tool tersedia)"
+
+    narrative = raw_dict.get("message_to_user", "")
+    days_count = len(raw_dict.get("itinerary_days", []))
+    day_themes = [
+        f"Hari {d.get('day')}: {d.get('theme', 'Eksplorasi')}"
+        for d in raw_dict.get("itinerary_days", [])
+    ]
+    themes_str = "\n".join(day_themes)
+
+    repair_prompt = f"""
+Kamu adalah asisten JSON repair. Tugasmu adalah mengisi array `places` pada itinerary.
+
+Itinerary ini memiliki {days_count} hari:
+{themes_str}
+
+Narasi yang sudah dibuat (GUNAKAN INI sebagai referensi tempat yang harus dimasukkan):
+{narrative[:4000]}
+
+Data yang tersedia dari tool:
+{tool_data_str[:4000]}
+
+Tugasmu: Kembalikan HANYA objek JSON dengan key `itinerary_days`.
+Setiap hari WAJIB memiliki array `places` yang berisi minimal 3 attraction + 1 restaurant.
+
+Contoh format PlaceItem (WAJIB LENGKAP, gunakan data dari tool di atas untuk lat/lng):
+{{
+  "place_id": "ChIJ...",
+  "name": "Nama Tempat",
+  "category": "attraction",
+  "latitude": -8.5,
+  "longitude": 115.1,
+  "district": "Kuta",
+  "description": "Deskripsi singkat.",
+  "rating": 4.5,
+  "image_url": null,
+  "tags": ["wisata", "bali"],
+  "visit_time": "09:00",
+  "visit_duration_mins": 90,
+  "estimated_cost_idr": 50000,
+  "tips": "Tip berguna.",
+  "route_to_next": null
+}}
+
+Aturan:
+- Ekstrak SEMUA tempat yang disebut dalam narasi
+- Gunakan data dari tool untuk latitude/longitude (WAJIB diisi)
+- JANGAN mengarang tempat yang tidak ada di narasi atau data tool
+- Semua field route (route_to_next, dll) harus null
+- Kembalikan HANYA JSON: {{"itinerary_days": [{{"day": 1, "places": [...]}}, ...]}}
+"""
+
+    try:
+        client = _get_client()
+        repair_response = await client.chat.completions.create(
+            model=settings.openai_model_id,
+            messages=[
+                {"role": "system", "content": "Kamu adalah JSON repair assistant. Kembalikan HANYA JSON murni."},
+                {"role": "user", "content": repair_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+
+        repair_json = json.loads(repair_response.choices[0].message.content)
+        repaired_days = repair_json.get("itinerary_days", [])
+
+        if not repaired_days:
+            logger.warning("REPAIR: Repair call mengembalikan itinerary_days kosong juga.")
+            return raw_dict
+
+        # Merge repaired places ke raw_dict
+        repaired_map = {d.get("day"): d.get("places", []) for d in repaired_days}
+        total_repaired = 0
+        for day in raw_dict.get("itinerary_days", []):
+            day_num = day.get("day")
+            repaired_places = repaired_map.get(day_num, [])
+            if repaired_places and not day.get("places"):
+                day["places"] = repaired_places
+                total_repaired += len(repaired_places)
+
+        logger.info(f"REPAIR: Berhasil mengisi {total_repaired} places ke itinerary.")
+        return raw_dict
+
+    except Exception as e:
+        logger.error(f"REPAIR: repair_empty_places gagal: {e}")
+        return raw_dict
+
 
 @app.post("/api/chat", response_model=FinalAIResponse, tags=["AI Chat"])
 @limiter.limit(RATE_CHAT)
@@ -1267,29 +2141,45 @@ async def chat_with_heidi(
         db_districts = await supabase_service.get_db_districts()
         trip_params = await extract_trip_parameters_from_message(req.message, db_districts)
 
-        if trip_params.get("intent") == "edit" and not is_editing:
+        if trip_params.get("intent") in ["add_place", "delete_place", "swap_place"] and not is_editing:
             return FinalAIResponse(
                 response_type="chat",
-                message_to_user="Maaf, saat ini belum ada itinerary yang sedang kita susun. Kamu harus membuat itinerary liburan terlebih dahulu sebelum bisa mengubah tempat.",
-                suggested_replies=["Buatkan itinerary 3 hari", "Rekomendasi tempat di Ubud"],
-                itinerary_days=None,
-                base_hotel=None,
-                trip_title=None
-            )
-
-        if trip_params.get("intent") == "edit" and not is_editing:
-            logger.info(f"Early return: Menolak request edit '{req.message}' karena itinerary kosong.")
-            return FinalAIResponse(
-                response_type="chat",
-                message_to_user="Maaf, saat ini belum ada itinerary yang sedang kita susun. Kamu harus membuat itinerary liburan terlebih dahulu sebelum bisa mengubahnya. Mau aku buatkan untuk berapa hari?",
+                message_to_user="Maaf, saat ini belum ada itinerary yang sedang kita susun. Kamu harus membuat itinerary liburan terlebih dahulu sebelum bisa menambah atau menghapus tempat. Mau aku buatkan untuk berapa hari?",
                 suggested_replies=["Buatkan itinerary 3 hari", "Rekomendasi tempat di Ubud", "Cari pantai bagus"],
                 itinerary_days=None,
                 base_hotel=None,
                 trip_title=None
             )
+
+        if trip_params.get("intent") == "swap_place":
+            return FinalAIResponse(
+                response_type="chat",
+                message_to_user="Maaf, untuk menukar tempat (swapping), kamu harus melakukannya secara manual melalui editor itinerary. Aku hanya bisa membantu menambah atau menghapus tempat lewat chat. 😊",
+                suggested_replies=["Hapus tempat di Hari 1", "Tambahkan tempat di Hari 2"],
+                itinerary_days=None,
+                base_hotel=None,
+                trip_title=None
+            )
+
+        skip_llm_loop = False
+        parsed_data = None
+        if trip_params.get("intent") in ["add_place", "delete_place"] and is_editing:
+            edit_result = await execute_itinerary_edit(req.message, _effective_itinerary, trip_params["intent"])
+            if edit_result:
+                if edit_result.response_type == "chat":
+                    if is_authenticated:
+                        active_session_id = await supabase_service.get_or_create_chat_session(user_id, req.session_id)
+                        await supabase_service.save_chat_message(
+                            session_id=active_session_id,
+                            role="assistant",
+                            content=edit_result.message_to_user
+                        )
+                    return edit_result
+                parsed_data = edit_result
+                skip_llm_loop = True
         
         # JIKA GAGAL DETEKSI LOKASI & LOKASI PENTING UNTUK ITINERARY
-        if not trip_params["detected_location"] and req.mode == "general":
+        if not skip_llm_loop and not trip_params["detected_location"] and req.mode == "general":
             # Berhenti sejenak dan minta klarifikasi
             return {
                 "response_type": "clarifying",
@@ -1348,100 +2238,120 @@ async def chat_with_heidi(
 
         messages.append({"role": "user", "content": req.message})
 
-        # --- TOOL CALLING LOOP ---
-        # Wrapped in a 120-second hard timeout to prevent runaway requests
-        # from holding connections indefinitely.
-        MAX_LOOPS = 20
-        AI_TIMEOUT_SECONDS = 120
+        if not skip_llm_loop:
+            # --- TOOL CALLING LOOP ---
+            # Wrapped in a 120-second hard timeout to prevent runaway requests
+            # from holding connections indefinitely.
+            MAX_LOOPS = 20
+            AI_TIMEOUT_SECONDS = 120
 
-        async def _run_ai_loop() -> str:
-            loop_count = 0
-            _raw_text = ""
+            async def _run_ai_loop() -> str:
+                loop_count = 0
+                _raw_text = ""
 
-            while loop_count < MAX_LOOPS:
-                loop_count += 1
-                logger.info(f"AI loop {loop_count}/{MAX_LOOPS}")
-                response = await _get_client().chat.completions.create(
-                    model=settings.openai_model_id,
-                    messages=messages,
-                    tools=OPENAI_TOOLS,
-                    response_format={"type": "json_object"},
-                    temperature=0.1,
-                )
+                while loop_count < MAX_LOOPS:
+                    loop_count += 1
+                    logger.info(f"AI loop {loop_count}/{MAX_LOOPS}")
+                    response = await _get_client().chat.completions.create(
+                        model=settings.openai_model_id,
+                        messages=messages,
+                        tools=OPENAI_TOOLS,
+                        response_format={"type": "json_object"},
+                        temperature=0.1,
+                    )
 
-                response_message = response.choices[0].message
+                    response_message = response.choices[0].message
 
-                if response_message.tool_calls:
-                    messages.append(response_message.model_dump(exclude_none=True))
-                    for tool_call in response_message.tool_calls:
-                        func_name = tool_call.function.name
-                        func_to_call = AVAILABLE_FUNCTIONS.get(func_name)
+                    if response_message.tool_calls:
+                        messages.append(response_message.model_dump(exclude_none=True))
+                        for tool_call in response_message.tool_calls:
+                            func_name = tool_call.function.name
+                            func_to_call = AVAILABLE_FUNCTIONS.get(func_name)
 
-                        if not func_to_call:
-                            logger.warning(f"Tool tidak dikenal: {func_name}")
+                            if not func_to_call:
+                                logger.warning(f"Tool tidak dikenal: {func_name}")
+                                messages.append({
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": func_name,
+                                    "content": json.dumps({"error": f"Tool '{func_name}' tidak tersedia."})
+                                })
+                                continue
+
+                            try:
+                                func_args = json.loads(tool_call.function.arguments)
+                                logger.info(f"OpenAI panggil: {func_name}({func_args})")
+                                func_result = await func_to_call(**func_args)
+                            except Exception as e:
+                                # Log full detail server-side; return sanitized error to AI
+                                logger.error(f"Error pada {func_name}: {e}", exc_info=True)
+                                func_result = {"error": "Tool execution failed."}
+
                             messages.append({
                                 "tool_call_id": tool_call.id,
                                 "role": "tool",
                                 "name": func_name,
-                                "content": json.dumps({"error": f"Tool '{func_name}' tidak tersedia."})
+                                "content": json.dumps(func_result, default=str)
                             })
-                            continue
+                    else:
+                        _raw_text = response_message.content
+                        break
 
-                        try:
-                            func_args = json.loads(tool_call.function.arguments)
-                            logger.info(f"OpenAI panggil: {func_name}({func_args})")
-                            func_result = await func_to_call(**func_args)
-                        except Exception as e:
-                            # Log full detail server-side; return sanitized error to AI
-                            logger.error(f"Error pada {func_name}: {e}", exc_info=True)
-                            func_result = {"error": "Tool execution failed."}
+                if loop_count >= MAX_LOOPS and not _raw_text:
+                    raise HTTPException(
+                        status_code=504,
+                        detail="Proses AI terlalu lama. Silakan coba lagi."
+                    )
+                return _raw_text
 
-                        messages.append({
-                            "tool_call_id": tool_call.id,
-                            "role": "tool",
-                            "name": func_name,
-                            "content": json.dumps(func_result, default=str)
-                        })
-                else:
-                    _raw_text = response_message.content
-                    break
-
-            if loop_count >= MAX_LOOPS and not _raw_text:
+            try:
+                raw_text = await asyncio.wait_for(
+                    _run_ai_loop(),
+                    timeout=AI_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"AI loop timeout setelah {AI_TIMEOUT_SECONDS}s untuk user={user_id}"
+                )
                 raise HTTPException(
                     status_code=504,
-                    detail="Proses AI terlalu lama. Silakan coba lagi."
+                    detail="Permintaan AI melebihi batas waktu. Silakan coba lagi."
                 )
-            return _raw_text
 
-        try:
-            raw_text = await asyncio.wait_for(
-                _run_ai_loop(),
-                timeout=AI_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.error(
-                f"AI loop timeout setelah {AI_TIMEOUT_SECONDS}s untuk user={user_id}"
-            )
-            raise HTTPException(
-                status_code=504,
-                detail="Permintaan AI melebihi batas waktu. Silakan coba lagi."
-            )
-
-        # --- PARSE & VALIDASI JSON ---
-        try:
-            raw_dict = json.loads(raw_text)
-            raw_dict = sanitize_ai_output(raw_dict)
-            parsed_data = FinalAIResponse.model_validate(raw_dict)
-        except Exception as e:
-            logger.warning(f"Sanitasi JSON gagal, coba validasi mentah: {e}")
+            # --- PARSE & VALIDASI JSON ---
             try:
-                parsed_data = FinalAIResponse.model_validate_json(raw_text)
-            except Exception as e2:
-                logger.error(f"Validasi JSON total gagal: {e2}. raw_text={raw_text}")
-                raise HTTPException(status_code=500, detail=f"AI menghasilkan format JSON tidak valid: {e2}")
+                raw_dict = json.loads(raw_text)
+                raw_dict = sanitize_ai_output(raw_dict)
+                parsed_data = FinalAIResponse.model_validate(raw_dict)
+            except Exception as e:
+                logger.warning(f"Sanitasi JSON gagal, coba validasi mentah: {e}")
+                try:
+                    parsed_data = FinalAIResponse.model_validate_json(raw_text)
+                except Exception as e2:
+                    logger.error(f"Validasi JSON total gagal: {e2}. raw_text={raw_text}")
+                    raise HTTPException(status_code=500, detail=f"AI menghasilkan format JSON tidak valid: {e2}")
+        else:
+            raw_text = json.dumps(parsed_data.model_dump(), default=str)
 
         # --- POST-PROCESSING (hanya untuk itinerary) ---
         if parsed_data.response_type == "itinerary" and parsed_data.itinerary_days:
+
+            # REPAIR: Deteksi jika semua hari punya places kosong (model skip JSON population)
+            all_empty = all(
+                not day.places
+                for day in parsed_data.itinerary_days
+            )
+            if all_empty:
+                logger.warning("REPAIR TRIGGERED: Semua days punya places:[] kosong. Menjalankan repair...")
+                raw_dict = json.loads(raw_text)
+                raw_dict = sanitize_ai_output(raw_dict)
+                raw_dict = await repair_empty_places(raw_dict, messages)
+                raw_dict = sanitize_ai_output(raw_dict)  # sanitize ulang setelah repair
+                try:
+                    parsed_data = FinalAIResponse.model_validate(raw_dict)
+                except Exception as val_err:
+                    logger.error(f"REPAIR: Validasi setelah repair gagal: {val_err}")
+                    # Lanjut dengan data asli (lebih baik kosong daripada error)
 
             # Deteksi district dari raw_text dan pesan user
             district_hint = extract_district_hint(raw_text, req.message)
@@ -1450,12 +2360,15 @@ async def chat_with_heidi(
             # 1. HOTEL GUARANTEE — Pastikan base_hotel selalu ada
             parsed_data = await guarantee_base_hotel(parsed_data, district_hint, preference_mode)
 
-            # 2. MEAL SCHEDULING — v9.0: Handled by Heidi AI
+            # 2. COORDINATE ENRICHMENT — Jika AI lupa isi lat/lng, backend ambil dari DB via place_id
+            parsed_data = await enrich_place_coordinates(parsed_data)
+
+            # 3. MEAL SCHEDULING — v9.0: Handled by Heidi AI
             # Restaurants are delivered in the per-day pool from
             # generate_clustered_pool_delivery. AI places them at
             # Lunch (12:00-13:30) and Dinner (18:30-20:00).
 
-            # 3. ROUTING INJECTION — Backend hitung rute (tidak berubah dari v7)
+            # 4. ROUTING INJECTION — Backend hitung rute (tidak berubah dari v7)
             hotel = parsed_data.base_hotel
             hotel_lat = hotel.latitude if hotel else None
             hotel_lng = hotel.longitude if hotel else None
