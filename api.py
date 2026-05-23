@@ -1352,206 +1352,20 @@ OPENAI_TOOLS = [
 
 
 # ============================================================
-# HEIDI SYSTEM PROMPT
+# HEIDI SYSTEM PROMPT LOAD HELPER
 # ============================================================
 
-def build_heidi_prompt(
-    mode: str,
-    is_editing: bool,
-    current_itinerary: Optional[Dict],
-    poi_budget: dict,
-    preference_mode: str = "standard",
-) -> str:
-    schema_string = json.dumps(FinalAIResponse.model_json_schema(), indent=2)
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+def load_prompt_from_md(file_name: str, replacements: dict) -> str:
+    filepath = os.path.join(os.path.dirname(__file__), "prompts", file_name)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+            for key, value in replacements.items():
+                content = content.replace(f"[{key}]", str(value))
+            return content
+    except FileNotFoundError:
+        return "Prompt file not found."
 
-    # Map preference_mode ke label yang mudah dibaca
-    _budget_label_map = {
-        "budget": "Hemat (budget) — prioritaskan tempat terjangkau & value for money",
-        "luxury": "Mewah (luxury) — prioritaskan tempat premium & eksklusif",
-        "standard": "Menengah (moderate) — keseimbangan harga dan kualitas",
-    }
-    _budget_label = _budget_label_map.get(preference_mode, _budget_label_map["standard"])
-
-    # Informasikan AI tentang perubahan arsitektur v9.0
-    poi_budget_context = f"""
-## KONTEKS: RADIUS & ANCHOR-FIRST CLUSTERING
-Backend menggunakan metode clustering baru untuk menghasilkan
-pool POI + restoran yang geographically tight per hari.
-
-  • Pace perjalanan        : {poi_budget.get('pace_label', 'normal')}
-  • Atraksi per hari       : {poi_budget.get('attractions_per_day', 4)} tempat wisata (default, bisa dinamis 2-4)
-  • Preferensi anggaran    : {_budget_label}
-
-PENTING:
-  • Tool get_smart_recommendations kini mengembalikan data PER HARI:
-     [{{"day": 1, "anchor": {{...}}, "pois": [...], "restaurants": [...]}}, ...]
-  • Restoran SUDAH TERMASUK di output tool — KAMU WAJIB memasukkannya ke places[]
-  • Sisipkan restoran di slot waktu makan: Lunch (12:00-13:30), Dinner (18:30-20:00)
-  • Urutkan semua places berdasarkan visit_time secara kronologis
-  • Saat memanggil get_smart_recommendations, WAJIB sertakan preference_mode="{preference_mode}"
-"""
-
-    if is_editing:
-        edit_context = json.dumps(current_itinerary, ensure_ascii=False, indent=2)
-        mode_instruction = f"""
-## MODE: EDIT ITINERARY (via Chat)
-Kamu sedang memodifikasi itinerary berikut:
-{edit_context}
-
-## ATURAN EDIT:
-1. HAPUS TEMPAT BERDASARKAN NAMA: Cari item di array `places` yang namanya cocok, keluarkan dari array.
-2. HAPUS TEMPAT BERDASARKAN POSISI: Gunakan indeks array (0-based).
-3. TAMBAH TEMPAT SPESIFIK: WAJIB panggil tool `search_specific_place_nearby`. Untuk parameter `lat` dan `lng`, kamu WAJIB mengambil latitude dan longitude dari salah satu tempat wisata (POI) yang SUDAH ADA di dalam array hari tersebut. Ini untuk memastikan tempat yang baru ditambahkan jaraknya berdekatan dan tidak merusak rute.
-4. TAMBAH TEMPAT TANPA NAMA (tema/vibe): Panggil `get_nearby_places` atau `get_smart_recommendations`.
-5. JANGAN menghitung atau mengisi field rute apapun.
-6. Kembalikan SELURUH struktur itinerary yang sudah dimodifikasi.
-7. Hotel (base_hotel) TIDAK BOLEH berubah kecuali user eksplisit minta ganti hotel.
-8. Field `route_to_next`, `day_full_polyline`, `day_total_distance_km`, `day_total_travel_time_mins` HARUS null.
-"""
-    elif mode == "deep_research":
-        mode_instruction = """
-## MODE: DEEP RESEARCH (Riset Mendalam)
-Sebelum membuat itinerary, pastikan 5 VARIABEL berikut sudah terpenuhi dari chat history:
-  ① LOKASI: Kabupaten/area di Bali yang ingin dikunjungi
-  ② TANGGAL: Tanggal mulai (format YYYY-MM-DD)
-  ③ DURASI: Berapa hari perjalanan
-  ④ BUDGET: Kisaran anggaran (low/medium/high atau nominal IDR)
-  ⑤ COMPANION: Pergi sendiri, berdua, keluarga, atau rombongan
-  ⑥ PACE: Santai (sedikit tempat) atau padat (banyak tempat)
-
-- Jika SEMUA variabel sudah ada → lanjut buat itinerary.
-- Jika ADA YANG KURANG → response_type="clarifying". Isi `clarifying_questions`.
-- Jika user hanya menyapa → response_type="chat".
-"""
-    else:
-        mode_instruction = f"""
-## MODE: GENERAL (Langsung Proses)
-- Jika user MENYAPA atau NGOBROL BIASA: response_type="chat". JANGAN panggil tool.
-- Jika user HANYA MINTA REKOMENDASI tanpa jadwal: panggil get_smart_recommendations, response_type="recommendation".
-- Jika user MINTA ITINERARY LENGKAP → lanjut ke alur pembuatan.
-  Jika tidak ada tanggal → asumsikan besok ({tomorrow_str}).
-  Jika tidak ada durasi → asumsikan 1-2 hari.
-  Jika tidak ada budget → asumsikan menengah.
-  JANGAN BERTANYA jika data kurang! Langsung buatkan dengan asumsi!
-"""
-
-    # ── Dynamic rule 12 & workflow: completely different in edit vs. create mode ──
-    if is_editing:
-        rule_12_dynamic = (
-            "12. **ABAIKAN KUOTA MINIMUM & HANDLING HARI KOSONG**: Karena ini mode EDIT, kamu WAJIB "
-            "MENGABAIKAN aturan batas minimum atraksi harian. Biarkan array `places` pada hari tersebut "
-            "berkurang atau kosong jika user memang memintanya.\n"
-            "⚠️ **[CRITICAL EDGE CASE - HARI KOSONG]**: Jika penghapusan tempat oleh user mengakibatkan "
-            "array `places` pada suatu hari menjadi KOSONG TOTAL, kamu WAJIB mendeteksinya secara sadar "
-            "(self-aware). Jangan diam saja! Di dalam `message_to_user`, beritahu user secara ramah bahwa "
-            "jadwal untuk hari tersebut sekarang kosong, lalu berikan saran ide/opsi aktivitas menarik "
-            "untuk mengisinya kembali."
-        )
-
-        workflow_instruction = """
-## ALUR KERJA EDIT ITINERARY (PARTIAL UPDATE ONLY)
-STEP 1 → Analisis pesan user: Apakah meminta HAPUS (Delete) atau TAMBAH (Add)?
-STEP 2 → JIKA USER MINTA HAPUS: Cukup hilangkan objek tempat tersebut dari array `places` pada hari yang dimaksud. JANGAN panggil tool pencarian global atau nearby apa pun! Cukup eliminasi item dari array JSON yang sudah ada.
-STEP 3 → JIKA USER MINTA TAMBAH TEMPAT SPESIFIK: Kamu WAJIB memanggil tool `search_specific_place_nearby`. Untuk parameter `lat` dan `lng`, kamu WAJIB mengambil koordinat dari salah satu tempat wisata (POI) yang SUDAH ADA di dalam array hari tersebut. Ini untuk memastikan tempat baru dikunci dalam radius berdekatan (~15km) dan tidak membuat rute hari itu melompat jauh.
-STEP 4 → JIKA USER MINTA TAMBAH TEMPAT SECARA UMUM/GENERIK: Kamu WAJIB memanggil `get_smart_recommendations` atau `get_nearby_places`. DILARANG KERAS bertanya kembali kepada user atau menawarkan pilihan! Pilih 1 tempat terbaik yang paling relevan dengan tema yang diminta (misal: "air terjun di Bangli"), masukkan tempat tersebut ke dalam itinerary, dan langsung konfirmasi perubahannya di `message_to_user`. Tugasmu adalah eksekusi, bukan berdiskusi.
-STEP 5 → IMMUTABLE CLONING (MANDATORY): Untuk hari-hari (Day) atau data lain yang TIDAK diminta untuk diubah oleh user, kamu WAJIB menyalin (clone) seluruh strukturnya secara persis 100%, termasuk `latitude`, `longitude`, `place_id`, `name`, dan semua field lainnya. JANGAN mengubah, menghapus, atau mempersingkat data apapun yang tidak diminta user.
-STEP 6 → KOORDINAT WAJIB DIJAGA: Setiap PlaceItem di semua hari HARUS memiliki `latitude` dan `longitude` yang tidak null. Saat cloning, pastikan kamu menyalin nilai numerik koordinat persis seperti yang ada di `current_itinerary` yang diberikan.
-STEP 7 → LARANGAN ROUTING: Biarkan semua field rute harian (`route_to_next`, `day_full_polyline`, `day_total_distance_km`, `day_total_travel_time_mins`) selalu bernilai `null` karena backend TomTom yang akan menghitung ulang jalurnya secara otomatis setelah JSON divalidasi.
-STEP 8 → Tulis narasi konfirmasi hangat di `message_to_user` dan kembalikan struktur JSON penuh. Pastikan `response_type` tetap `"itinerary"`.
-ATURAN KRITIKAL: DILARANG KERAS menggunakan frasa seperti "Tunggu sebentar", "Sedang diproses", atau "Aku akan segera kirimkan". Langsung berikan konfirmasi tegas bahwa jadwal SUDAH berhasil diperbarui!
-"""
-    else:
-        rule_12_dynamic = (
-            f"12. **ATRAKSI MINIMUM**: Setiap hari WAJIB memiliki minimal "
-            f"{poi_budget.get('min_attractions', 2)} atraksi wisata (di luar restoran). "
-            "Jika bahan dari tool kurang, panggil tool kembali dengan query berbeda."
-        )
-
-        workflow_instruction = f"""
-## ALUR KERJA PEMBUATAN ITINERARY BARU (FULL GENERATION)
-STEP 1 → Panggil `get_bali_context(date_start, date_end, district)` untuk mengambil info cuaca & avoid_zones.
-STEP 2 → Panggil `get_smart_recommendations(query, num_days=N, category="poi", preference_mode="{preference_mode}")` untuk menarik data POI + Restoran terkluster.
-STEP 3 → Panggil `get_nearby_places(lat, lng, category="hotel")` menggunakan anchor koordinat Hari 1 untuk menentukan `base_hotel`.
-STEP 4 → Panggil `validate_itinerary_safety(poi_ids, date_start, date_end)` untuk memastikan keamanan ritual adat.
-STEP 5 → Susun `places` harian: gabungkan atraksi dan restoran, lalu URUTKAN KRONOLOGIS berdasarkan `visit_time`.
-STEP 6 → Tulis `message_to_user` berupa narasi storytelling yang hangat minimal 250 kata.
-STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
-"""
-
-    return f"""
-Kamu adalah **Heidi**, asisten perjalanan AI spesialis Bali dari SobatNavi.
-Kepribadianmu: hangat, informatif, dan sangat paham budaya Bali.
-Hari ini: {today_str}. Asumsi keberangkatan jika tidak disebutkan: besok ({tomorrow_str}).
-
-{poi_budget_context}
-
-{mode_instruction}
-
-## ATURAN MUTLAK (WAJIB DIPATUHI)
-1. **FORMAT JSON**: Balas HANYA dengan JSON murni (tidak ada teks di luar JSON, tidak ada ```json```)
-2. **MARKDOWN WAJIB di `message_to_user`**: Gunakan **bold**, *italic*, ## heading, - list, emoji.
-3. **ANTI-HALUSINASI**: DILARANG mengarang nama tempat, place_id, latitude, longitude. Semua dari Tool.
-4. **SATU HOTEL**: Pilih SATU `base_hotel` untuk SEMUA hari. Hotel TIDAK BOLEH muncul di dalam `places` harian.
-5. **LARANGAN ROUTING**: JANGAN isi field rute apapun. `route_to_next`, `day_full_polyline`, `day_total_distance_km`, `day_total_travel_time_mins` WAJIB null.
-6. **DATA WAJIB DI SETIAP PlaceItem (SEMUA HARUS DIISI, TIDAK BOLEH NULL)**:
-   - `place_id`: Dari field `place_id` hasil tool. WAJIB DIISI agar koordinat bisa di-lookup.
-   - `latitude` & `longitude`: WAJIB dari field `latitude`/`longitude` hasil tool. COPY PERSIS, JANGAN dikira-kira.
-   - `name`: Dari field `name` hasil tool.
-   - `district`: Dari field `district` hasil tool.
-   - `rating`: Dari field `rating` hasil tool.
-   - `description`: Dari field `content` hasil tool.
-   - `image_url`: Dari field `image_url` hasil tool.
-   - `tags`: 3-5 label dari deskripsi. WAJIB DIISI.
-   - `estimated_cost_idr`: Estimasi biaya per orang (pura ~15000, pantai ~25000, museum ~50000, makan ~75000). WAJIB DIISI.
-   - `visit_duration_mins`: Durasi estimasi (pura kecil=45, pantai=75, museum=90, restoran=50). WAJIB DIISI.
-   - `visit_time`: HH:MM 24-jam sesuai urutan (pagi mulai 08:00). WAJIB DIISI.
-   - `tips`: Satu kalimat tip berguna. WAJIB DIISI.
-
-## PETA DATA TOOL → PLACEITEM (WAJIB IKUTI)
-Saat `get_smart_recommendations(category='poi')` dipanggil, responnya berstruktur:
-```
-[
-  {{"day": 1, "anchor": {{"lat": -8.5, "lng": 115.1}}, "pois": [POI_OBJECT, ...], "restaurants": [RESTO_OBJECT, ...]}},
-  ...
-]
-```
-Untuk setiap POI_OBJECT atau RESTO_OBJECT, petakan ke PlaceItem PERSIS sebagai berikut:
-- `place_id`  ← `poi.place_id`
-- `name`      ← `poi.name`
-- `latitude`  ← `poi.latitude`   ← **WAJIB COPY, jangan null!**
-- `longitude` ← `poi.longitude`  ← **WAJIB COPY, jangan null!**
-- `district`  ← `poi.district`
-- `rating`    ← `poi.rating`
-- `description` ← `poi.content`
-- `image_url` ← `poi.image_url`
-- `category`  ← "attraction" untuk POI, "restaurant" untuk restoran
-
-7. **HARI WAJIB SESUAI PERMINTAAN (CRITICAL)**:
-   Jika user meminta N hari, kamu WAJIB menghasilkan TEPAT N objek `day` di dalam `itinerary_days`.
-   DILARANG KERAS mengurangi jumlah hari. Jika pool POI kurang, variasikan query ke tool.
-8. **POI BUDGETING DINAMIS**:
-   Default: 2-4 atraksi per hari. TAPI jika user eksplisit minta jumlah tertentu
-   (misal "buat padat 5 tempat"), PATUHI permintaan user tersebut.
-9. **RESTORAN WAJIB DIMASUKKAN KE PLACES**:
-   Tool get_smart_recommendations menyediakan pool `restaurants[]` per hari.
-   KAMU WAJIB memasukkan restoran dari pool ini ke dalam array `places` pada waktu makan:
-   - Makan Siang (Lunch): visit_time antara 12:00 - 13:30
-   - Makan Malam (Dinner): visit_time antara 18:30 - 20:00
-   Urutkan semua places (atraksi + restoran) secara kronologis berdasarkan `visit_time`.
-10. **KATEGORI TEMPAT**: Untuk field `category` di dalam objek tempat: HANYA "attraction", "hotel", atau "restaurant".
-11. **SUGGESTED REPLIES**: Selalu isi `suggested_replies` dengan 3 saran pertanyaan relevan.
-{rule_12_dynamic}
-
-{workflow_instruction}
-
-
-SANGAT PENTING: Untuk SETIAP tempat yang kamu sebutkan dalam message_to_user, kamu WAJIB memasukkan data tempat tersebut ke dalam array itinerary_days dengan struktur JSON yang lengkap. Jika kamu tidak memasukkannya ke JSON, maka itinerary dianggap tidak valid.
-
-SKEMA JSON OUTPUT (WAJIB IKUTI PERSIS)
-{schema_string}
-"""
 
 # ============================================================
 # BACKEND MEAL INJECTION (DEPRECATED v9.0 — kept for reference)
@@ -2213,8 +2027,134 @@ async def chat_with_heidi(
         _budget_to_mode = {"budget": "budget", "moderate": "standard", "luxury": "luxury"}
         preference_mode = _budget_to_mode.get(req.budget_preference, "standard")
 
-        # --- BUILD SYSTEM PROMPT ---
-        system_prompt = build_heidi_prompt(req.mode, is_editing, _effective_itinerary, poi_budget, preference_mode)
+        # --- DYNAMIC AGENT ROUTING & PROMPT LOADING ---
+        intent = trip_params.get("intent", "chat") or "chat"
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        schema_string = json.dumps(FinalAIResponse.model_json_schema(), indent=2)
+
+        replacements = {
+            "TODAY": today_str,
+            "TOMORROW": tomorrow_str,
+            "SCHEMA_STRING": schema_string,
+        }
+
+        active_tools = []
+        if intent == "create":
+            replacements.update({
+                "PACE": poi_budget.get('pace_label', 'normal'),
+                "ATTRACTIONS_COUNT": poi_budget.get('attractions_per_day', 4),
+                "PREFERENCE_MODE": preference_mode,
+            })
+            system_prompt = load_prompt_from_md("creator_agent.md", replacements)
+            allowed_names = ["get_bali_context", "get_smart_recommendations", "validate_itinerary_safety", "get_nearby_places"]
+            active_tools = [tool for tool in OPENAI_TOOLS if tool["function"]["name"] in allowed_names]
+        else:
+            if is_editing:
+                edit_context = json.dumps(_effective_itinerary, ensure_ascii=False, indent=2)
+                mode_instruction = f"""
+## MODE: EDIT ITINERARY (via Chat)
+Kamu sedang memodifikasi itinerary berikut:
+{edit_context}
+
+## ATURAN EDIT:
+1. HAPUS TEMPAT BERDASARKAN NAMA: Cari item di array `places` yang namanya cocok, keluarkan dari array.
+2. HAPUS TEMPAT BERDASARKAN POSISI: Gunakan indeks array (0-based).
+3. TAMBAH TEMPAT SPESIFIK: WAJIB panggil tool `search_specific_place_nearby`. Untuk parameter `lat` dan `lng`, kamu WAJIB mengambil latitude dan longitude dari salah satu tempat wisata (POI) yang SUDAH ADA di dalam array hari tersebut. Ini untuk memastikan tempat yang baru ditambahkan jaraknya berdekatan dan tidak merusak rute.
+4. TAMBAH TEMPAT TANPA NAMA (tema/vibe): Panggil `get_nearby_places` atau `get_smart_recommendations`.
+5. JANGAN menghitung atau mengisi field rute apapun.
+6. Kembalikan SELURUH struktur itinerary yang sudah dimodifikasi.
+7. Hotel (base_hotel) TIDAK BOLEH berubah kecuali user eksplisit minta ganti hotel.
+8. Field `route_to_next`, `day_full_polyline`, `day_total_distance_km`, `day_total_travel_time_mins` HARUS null.
+"""
+                rule_12_dynamic = (
+                    "12. **ABAIKAN KUOTA MINIMUM & HANDLING HARI KOSONG**: Karena ini mode EDIT, kamu WAJIB "
+                    "MENGABAIKAN aturan batas minimum atraksi harian. Biarkan array `places` pada hari tersebut "
+                    "berkurang atau kosong jika user memang memintanya.\n"
+                    "⚠️ **[CRITICAL EDGE CASE - HARI KOSONG]**: Jika penghapusan tempat oleh user mengakibatkan "
+                    "array `places` pada suatu hari menjadi KOSONG TOTAL, kamu WAJIB mendeteksinya secara sadar "
+                    "(self-aware). Jangan diam saja! Di dalam `message_to_user`, beritahu user secara ramah bahwa "
+                    "jadwal untuk hari tersebut sekarang kosong, lalu berikan saran ide/opsi aktivitas menarik "
+                    "untuk mengisinya kembali."
+                )
+                workflow_instruction = """
+## ALUR KERJA EDIT ITINERARY (PARTIAL UPDATE ONLY)
+STEP 1 → Analisis pesan user: Apakah meminta HAPUS (Delete) atau TAMBAH (Add)?
+STEP 2 → JIKA USER MINTA HAPUS: Cukup hilangkan objek tempat tersebut dari array `places` pada hari yang dimaksud. JANGAN panggil tool pencarian global atau nearby apa pun! Cukup eliminasi item dari array JSON yang sudah ada.
+STEP 3 → JIKA USER MINTA TAMBAH TEMPAT SPESIFIK: Kamu WAJIB memanggil tool `search_specific_place_nearby`. Untuk parameter `lat` dan `lng`, kamu WAJIB mengambil koordinat dari salah satu tempat wisata (POI) yang SUDAH ADA di dalam array hari tersebut. Ini untuk memastikan tempat baru dikunci dalam radius berdekatan (~15km) dan tidak membuat rute hari itu melompat jauh.
+STEP 4 → JIKA USER MINTA TAMBAH TEMPAT SECARA UMUM/GENERIK: Kamu WAJIB memanggil `get_smart_recommendations` atau `get_nearby_places`. DILARANG KERAS bertanya kembali kepada user atau menawarkan pilihan! Pilih 1 tempat terbaik yang paling relevan dengan tema yang diminta (misal: "air terjun di Bali"), masukkan tempat tersebut ke dalam itinerary, dan langsung konfirmasi perubahannya di `message_to_user`. Tugasmu adalah eksekusi, bukan berdiskusi.
+STEP 5 → IMMUTABLE CLONING (MANDATORY): Untuk hari-hari (Day) atau data lain yang TIDAK diminta untuk diubah oleh user, kamu WAJIB menyalin (clone) seluruh strukturnya secara persis 100%, termasuk `latitude`, `longitude`, `place_id`, `name`, dan semua field lainnya. JANGAN mengubah, menghapus, atau mempersingkat data apapun yang tidak diminta user.
+STEP 6 → KOORDINAT WAJIB DIJAGA: Setiap PlaceItem di semua hari HARUS memiliki `latitude` and `longitude` yang tidak null. Saat cloning, pastikan kamu menyalin nilai numerik koordinat persis seperti yang ada di `current_itinerary` yang diberikan.
+STEP 7 → LARANGAN ROUTING: Biarkan semua field rute harian (`route_to_next`, `day_full_polyline`, `day_total_distance_km`, `day_total_travel_time_mins`) selalu bernilai `null` karena backend TomTom yang akan menghitung ulang jalurnya secara otomatis setelah JSON divalidasi.
+STEP 8 → Tulis narasi konfirmasi hangat di `message_to_user` dan kembalikan struktur JSON penuh. Pastikan `response_type` tetap `"itinerary"`.
+ATURAN KRITIKAL: DILARANG KERAS menggunakan frasa seperti "Tunggu sebentar", "Sedang diproses", atau "Aku akan segera kirimkan". Langsung berikan konfirmasi tegas bahwa jadwal SUDAH berhasil diperbarui!
+"""
+            elif req.mode == "deep_research":
+                mode_instruction = """
+## MODE: DEEP RESEARCH (Riset Mendalam)
+Sebelum membuat itinerary, pastikan 5 VARIABEL berikut sudah terpenuhi dari chat history:
+  ① LOKASI: Kabupaten/area di Bali yang ingin dikunjungi
+  ② TANGGAL: Tanggal mulai (format YYYY-MM-DD)
+  ③ DURASI: Berapa hari perjalanan
+  ④ BUDGET: Kisaran anggaran (low/medium/high atau nominal IDR)
+  ⑤ COMPANION: Pergi sendiri, berdua, keluarga, atau rombongan
+  ⑥ PACE: Santai (sedikit tempat) atau padat (banyak tempat)
+
+- Jika SEMUA variabel sudah ada → lanjut buat itinerary.
+- Jika ADA YANG KURANG → response_type="clarifying". Isi `clarifying_questions`.
+- Jika user hanya menyapa → response_type="chat".
+"""
+                rule_12_dynamic = (
+                    f"12. **ATRAKSI MINIMUM**: Setiap hari WAJIB memiliki minimal "
+                    f"{poi_budget.get('min_attractions', 2)} atraksi wisata (di luar restoran). "
+                    "Jika bahan dari tool kurang, panggil tool kembali dengan query berbeda."
+                )
+                workflow_instruction = f"""
+## ALUR KERJA PEMBUATAN ITINERARY BARU (FULL GENERATION)
+STEP 1 → Panggil `get_bali_context(date_start, date_end, district)` untuk mengambil info cuaca & avoid_zones.
+STEP 2 → Panggil `get_smart_recommendations(query, num_days=N, category="poi", preference_mode="{preference_mode}")` untuk menarik data POI + Restoran terkluster.
+STEP 3 → Panggil `get_nearby_places(lat, lng, category="hotel")` menggunakan anchor koordinat Hari 1 untuk menentukan `base_hotel`.
+STEP 4 → Panggil `validate_itinerary_safety(poi_ids, date_start, date_end)` untuk memastikan keamanan ritual adat.
+STEP 5 → Susun `places` harian: gabungkan atraksi dan restoran, lalu URUTKAN KRONOLOGIS berdasarkan `visit_time`.
+STEP 6 → Tulis `message_to_user` berupa narasi storytelling yang hangat minimal 250 kata.
+STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
+"""
+            else:
+                mode_instruction = f"""
+## MODE: GENERAL (Langsung Proses)
+- Jika user MENYAPA atau NGOBROL BIASA: response_type="chat". JANGAN panggil tool.
+- Jika user HANYA MINTA REKOMENDASI tanpa jadwal: panggil get_smart_recommendations, response_type="recommendation".
+- Jika user MINTA ITINERARY LENGKAP → lanjut ke alur pembuatan.
+  Jika tidak ada tanggal → asumsikan besok ({tomorrow_str}).
+  Jika tidak ada durasi → asumsikan 1-2 hari.
+  Jika tidak ada budget → asumsikan menengah.
+  JANGAN BERTANYA jika data kurang! Langsung buatkan dengan asumsi!
+"""
+                rule_12_dynamic = (
+                    f"12. **ATRAKSI MINIMUM**: Setiap hari WAJIB memiliki minimal "
+                    f"{poi_budget.get('min_attractions', 2)} atraksi wisata (di luar restoran). "
+                    "Jika bahan dari tool kurang, panggil tool kembali dengan query berbeda."
+                )
+                workflow_instruction = f"""
+## ALUR KERJA PEMBUATAN ITINERARY BARU (FULL GENERATION)
+STEP 1 → Panggil `get_bali_context(date_start, date_end, district)` untuk mengambil info cuaca & avoid_zones.
+STEP 2 → Panggil `get_smart_recommendations(query, num_days=N, category="poi", preference_mode="{preference_mode}")` untuk menarik data POI + Restoran terkluster.
+STEP 3 → Panggil `get_nearby_places(lat, lng, category="hotel")` menggunakan anchor koordinat Hari 1 untuk menentukan `base_hotel`.
+STEP 4 → Panggil `validate_itinerary_safety(poi_ids, date_start, date_end)` untuk memastikan keamanan ritual adat.
+STEP 5 → Susun `places` harian: gabungkan atraksi dan restoran, lalu URUTKAN KRONOLOGIS berdasarkan `visit_time`.
+STEP 6 → Tulis `message_to_user` berupa narasi storytelling yang hangat minimal 250 kata.
+STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
+"""
+
+            replacements.update({
+                "MODE_INSTRUCTION": mode_instruction,
+                "RULE_12_DYNAMIC": rule_12_dynamic,
+                "WORKFLOW_INSTRUCTION": workflow_instruction,
+            })
+            system_prompt = load_prompt_from_md("chatter_agent.md", replacements)
+            allowed_names = ["search_specific_place", "get_inspiration_narration"]
+            active_tools = [tool for tool in OPENAI_TOOLS if tool["function"]["name"] in allowed_names]
+
         messages = [{"role": "system", "content": system_prompt}]
         active_session_id = None
 
@@ -2255,7 +2195,7 @@ async def chat_with_heidi(
                     response = await _get_client().chat.completions.create(
                         model=settings.openai_model_id,
                         messages=messages,
-                        tools=OPENAI_TOOLS,
+                        tools=active_tools if active_tools else None,
                         response_format={"type": "json_object"},
                         temperature=0.1,
                     )
