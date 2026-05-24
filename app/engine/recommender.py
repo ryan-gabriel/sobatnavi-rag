@@ -787,9 +787,7 @@ def build_deterministic_itinerary(daily_pools: list[dict], user_requested_pois: 
         # 1. Determine target count of attractions
         target_count = 3
         if isinstance(user_requested_pois, dict):
-            target_count = user_requested_pois.get(str(day_num)) or user_requested_pois.get(day_num) or 3
-        elif isinstance(user_requested_pois, int):
-            target_count = user_requested_pois
+            target_count = user_requested_pois.get(str(day_num), 3)
         try:
             target_count = max(1, min(int(target_count), 7))
         except (ValueError, TypeError):

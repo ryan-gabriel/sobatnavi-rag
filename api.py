@@ -229,78 +229,63 @@ PACE_CONFIG = {
 def calculate_poi_budget(
     num_days: int,
     pace: str = "normal",
-    user_requested_pois: int | dict = None,
+    user_requested_pois: dict = None,
     is_half_day: bool = False,
 ) -> dict:
     """Menghitung 'anggaran' POI per hari secara programatik."""
     was_capped = False
-    max_allowed_pois = 7  # realistic maximum attractions per day (excluding restaurants/hotels)
-    
-    # Check if user requested specific counts per day
-    daily_targets_str = "Default (ikuti target atraksi per hari di atas)"
-    
-    if isinstance(user_requested_pois, dict):
-        # Clean and clamp dictionary values
-        clamped_dict = {}
-        for k, v in user_requested_pois.items():
-            try:
-                val = int(v)
-                if val > max_allowed_pois:
-                    val = max_allowed_pois
-                    was_capped = True
-                elif val < 1:
-                    val = 1
-                clamped_dict[k] = val
-            except (ValueError, TypeError):
-                continue
-        daily_targets_str = json.dumps(clamped_dict)
-        user_req_int = max(clamped_dict.values()) if clamped_dict.values() else 4
-    elif isinstance(user_requested_pois, int):
-        user_req_int = user_requested_pois
-        if user_req_int > max_allowed_pois:
-            user_req_int = max_allowed_pois
-            was_capped = True
-    else:
-        user_req_int = None
+    max_allowed_pois = 7
 
+    # 1. Determine base_default using pace logic
     if is_half_day:
-        if user_req_int is not None and user_req_int > 2:
-            user_req_int = 2
+        base_default = 2
+    else:
+        pace_key = pace.lower() if pace.lower() in PACE_CONFIG else "normal"
+        min_poi, ideal_poi, max_poi = PACE_CONFIG[pace_key]
+        if num_days >= 5:
+            ideal_poi = max(min_poi, ideal_poi - 1)
+        base_default = ideal_poi
+
+    # 2. Extract custom_days and check for default_count override
+    custom_days = {}
+    if isinstance(user_requested_pois, dict):
+        custom_days = user_requested_pois.get("custom_days") or {}
+        default_count = user_requested_pois.get("default_count")
+        if default_count is not None:
+            try:
+                base_default = int(default_count)
+            except (ValueError, TypeError):
+                pass
+
+    # 3. Generate full_targets mapping every day (from 1 to num_days) to an explicit integer
+    full_targets = {}
+    for d in range(1, num_days + 1):
+        target = base_default
+        day_str = str(d)
+        if day_str in custom_days:
+            try:
+                target = int(custom_days[day_str])
+            except (ValueError, TypeError):
+                pass
+        
+        # Clamp between 1 and 7
+        if target > max_allowed_pois:
+            target = max_allowed_pois
             was_capped = True
-            
-        return {
-            "attractions_per_day": user_req_int if user_req_int is not None else 2,
-            "meals_per_day": 1,
-            "pace_label": "setengah hari",
-            "daily_targets": daily_targets_str,
-            "was_capped": was_capped
-        }
+        elif target < 1:
+            target = 1
+        full_targets[day_str] = target
 
-    if user_req_int is not None:
-        user_req_int = max(1, min(user_req_int, max_allowed_pois))
-        return {
-            "attractions_per_day": user_req_int,
-            "meals_per_day": 2 if user_req_int >= 4 else 1,
-            "pace_label": f"custom ({user_req_int} tempat)",
-            "daily_targets": daily_targets_str,
-            "was_capped": was_capped
-        }
-
-    # Default Pace Logic
-    pace_key = pace.lower() if pace.lower() in PACE_CONFIG else "normal"
-    min_poi, ideal_poi, max_poi = PACE_CONFIG[pace_key]
-    
-    if num_days >= 5:
-        ideal_poi = max(min_poi, ideal_poi - 1)
+    daily_targets_str = json.dumps(full_targets)
+    avg_attractions = int(sum(full_targets.values()) / len(full_targets)) if full_targets else base_default
 
     return {
-        "attractions_per_day": ideal_poi,
-        "meals_per_day": 1 if pace_key == "santai" else 2,
-        "pace_label": pace_key,
-        "min_attractions": min_poi,
-        "max_attractions": max_poi,
+        "attractions_per_day": avg_attractions,
+        "meals_per_day": 1 if is_half_day else (2 if avg_attractions >= 4 else 1),
+        "pace_label": "setengah hari" if is_half_day else (f"custom ({avg_attractions} tempat)" if isinstance(user_requested_pois, dict) else pace),
         "daily_targets": daily_targets_str,
-        "was_capped": was_capped
+        "was_capped": was_capped,
+        "full_targets": full_targets
     }
 
 
@@ -319,7 +304,7 @@ async def extract_trip_parameters_from_message(message: str, db_districts: list[
             "   * Choose 'chat' for general greetings or questions.\n"
             "- pace: string, one of 'santai', 'padat', 'normal'.\n"
             "- is_half_day: boolean, true if half-day trip.\n"
-            "- user_requested_pois: object mapping day numbers (strings) to integer counts (e.g., {\"1\": 4, \"2\": 3}) IF the user specifies different amounts per day. If they specify a single amount for all days, return an integer. Otherwise, return null.\n"
+            "- user_requested_pois: object containing 'custom_days' (map of day string to integer) AND 'default_count' (integer). E.g., if user says 'day 1 needs 1 place, other days 3 places', return {\"custom_days\": {\"1\": 1}, \"default_count\": 3}. If '4 places per day', return {\"custom_days\": {}, \"default_count\": 4}. Return null if completely unspecified.\n"
             "- detected_location: string or null.\n"
             "- normalized_districts: list of strings matching this allowed list:\n"
             f"{db_districts}\n\n"
@@ -2309,8 +2294,8 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
                                 
                                 # Inject user_requested_pois if calling get_smart_recommendations for POI category
                                 if func_name == "get_smart_recommendations" and func_args.get("category", "poi") == "poi":
-                                    if "user_requested_pois" not in func_args and trip_params.get("user_requested_pois"):
-                                        func_args["user_requested_pois"] = trip_params["user_requested_pois"]
+                                    if "user_requested_pois" not in func_args and poi_budget.get("full_targets"):
+                                        func_args["user_requested_pois"] = poi_budget["full_targets"]
                                 
                                 logger.info(f"OpenAI panggil: {func_name}({func_args})")
                                 func_result = await func_to_call(**func_args)
