@@ -43,12 +43,13 @@ async def get_smart_recommendations(
     num_days: int = Field(1, description="Jumlah hari perjalanan"),
     category: str = Field("poi", description="'poi', 'hotel', atau 'restaurant'"),
     preference_mode: str = Field("standard", description="'standard', 'hidden_gem', 'luxury', 'budget'"),
-    user_detected_location: str = Field(None, description="District/area Bali yang disebutkan user (opsional)")
+    user_detected_location: str = Field(None, description="District/area Bali yang disebutkan user (opsional)"),
+    user_requested_pois: dict = Field(None, description="Target jumlah tempat per hari (JSON map, misal: {'1': 5})")
 ) -> list[dict]:
     """
     Cari tempat wisata dengan Radius & Anchor-First clustering + TOPSIS ranking.
     Untuk category='poi': mengembalikan pool POI + restoran per hari yang geographically tight.
-    Output berisi per-hari: {day, anchor, pois[], restaurants[]}.
+    Output berisi per-hari: {day, theme, places[]}.
     """
     if category == "hotel":
         raw = await supabase_service.search_amenities_semantic(query, "hotel", limit=40)
@@ -63,7 +64,38 @@ async def get_smart_recommendations(
             num_days=num_days,
             user_detected_location=user_detected_location,
             preference_mode=preference_mode,
+            user_requested_pois=user_requested_pois,
         )
+
+
+@mcp.tool()
+async def get_general_recommendations(
+    query: str = Field(
+        ..., 
+        description=(
+            "WAJIB QUERY TRANSFORMATION (maks 15 kata). "
+            "EDGE CASE: Jika query user terlalu luas, persempit dengan kata kunci relevan. "
+            "Jika hasil kosong, jangan berhalusinasi."
+        )
+    ),
+    category: str = Field("poi", description="'poi', 'hotel', atau 'restaurant'"),
+    limit: int = Field(5, description="Jumlah rekomendasi (default 5)")
+) -> list[dict]:
+    """
+    Gunakan tool ini HANYA untuk rekomendasi tempat umum tanpa membuat itinerary.
+    WAJIB LAKUKAN QUERY TRANSFORMATION! Ubah ke frasa deskriptif (maks 15 kata).
+    EDGE CASE HANDLING: Jika user bertanya terlalu luas (misal: 'tempat bagus'), tambahkan kata kunci default seperti 'wisata populer indah bali'.
+    Jika hasil dari database kosong, JANGAN mengarang tempat palsu.
+    """
+    if category == "hotel":
+        raw = await supabase_service.search_amenities_semantic(query, "hotel", limit=limit * 4)
+        return rank_pois_by_topsis(raw, category="hotel", preference_mode="standard", top_n=limit)
+    elif category == "restaurant":
+        raw = await supabase_service.search_amenities_semantic(query, "restaurant", limit=limit * 4)
+        return rank_pois_by_topsis(raw, category="restaurant", preference_mode="standard", top_n=limit)
+    else:
+        raw = await supabase_service.search_pois_semantic(query=query, limit=limit * 4)
+        return rank_pois_by_topsis(raw, category="poi", preference_mode="standard", top_n=limit)
 
 
 @mcp.tool()

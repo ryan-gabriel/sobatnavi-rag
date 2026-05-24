@@ -33,7 +33,7 @@ from openai import AsyncOpenAI
 from typing import List, Dict, Optional, Literal
 from datetime import datetime, timedelta
 
-from app.schemas.response_schema import BaseHotel, FinalAIResponse, ItinerarySummary, RouteSegment
+from app.schemas.response_schema import BaseHotel, FinalAIResponse, ItinerarySummary, RouteSegment, DailyItinerary, PlaceItem, BudgetBreakdown
 from app.services.supabase_service import supabase_service
 from app.services.tomtom_service import tomtom_service
 from app.services.live_intel_service import live_intel_service
@@ -229,64 +229,80 @@ PACE_CONFIG = {
 def calculate_poi_budget(
     num_days: int,
     pace: str = "normal",
-    user_requested_pois: int = None,
+    user_requested_pois: int | dict = None,
     is_half_day: bool = False,
 ) -> dict:
-    """
-    Menghitung 'anggaran' POI per hari secara programatik.
+    """Menghitung 'anggaran' POI per hari secara programatik."""
+    was_capped = False
+    max_allowed_pois = 7  # realistic maximum attractions per day (excluding restaurants/hotels)
+    
+    # Check if user requested specific counts per day
+    daily_targets_str = "Default (ikuti target atraksi per hari di atas)"
+    
+    if isinstance(user_requested_pois, dict):
+        # Clean and clamp dictionary values
+        clamped_dict = {}
+        for k, v in user_requested_pois.items():
+            try:
+                val = int(v)
+                if val > max_allowed_pois:
+                    val = max_allowed_pois
+                    was_capped = True
+                elif val < 1:
+                    val = 1
+                clamped_dict[k] = val
+            except (ValueError, TypeError):
+                continue
+        daily_targets_str = json.dumps(clamped_dict)
+        user_req_int = max(clamped_dict.values()) if clamped_dict.values() else 4
+    elif isinstance(user_requested_pois, int):
+        user_req_int = user_requested_pois
+        if user_req_int > max_allowed_pois:
+            user_req_int = max_allowed_pois
+            was_capped = True
+    else:
+        user_req_int = None
 
-    Returns dict:
-        - attractions_per_day: jumlah atraksi (bukan restoran) per hari
-        - meals_per_day: berapa sesi makan yang akan disisipkan
-        - total_places_per_day: total places (atraksi + restoran)
-        - fetch_buffer_multiplier: multiplier untuk fetch ke DB (selalu lebih banyak dari yang ditampilkan)
-    """
     if is_half_day:
-        # Trip setengah hari: maksimal 2 atraksi + 1 makan
+        if user_req_int is not None and user_req_int > 2:
+            user_req_int = 2
+            was_capped = True
+            
         return {
-            "attractions_per_day": 2,
+            "attractions_per_day": user_req_int if user_req_int is not None else 2,
             "meals_per_day": 1,
-            "total_places_per_day": 3,
-            "fetch_buffer_multiplier": 3,
             "pace_label": "setengah hari",
+            "daily_targets": daily_targets_str,
+            "was_capped": was_capped
         }
 
-    if user_requested_pois is not None:
-        # User secara eksplisit meminta jumlah tempat tertentu
-        user_req = max(1, min(user_requested_pois, 8))  # Clamp: 1-8
-        meals = 2 if user_req >= 4 else 1
+    if user_req_int is not None:
+        user_req_int = max(1, min(user_req_int, max_allowed_pois))
         return {
-            "attractions_per_day": user_req,
-            "meals_per_day": meals,
-            "total_places_per_day": user_req + meals,
-            "fetch_buffer_multiplier": 3,
-            "pace_label": f"custom ({user_req} tempat)",
+            "attractions_per_day": user_req_int,
+            "meals_per_day": 2 if user_req_int >= 4 else 1,
+            "pace_label": f"custom ({user_req_int} tempat)",
+            "daily_targets": daily_targets_str,
+            "was_capped": was_capped
         }
 
-    pace_key = pace.lower()
-    if pace_key not in PACE_CONFIG:
-        pace_key = "normal"
-
+    # Default Pace Logic
+    pace_key = pace.lower() if pace.lower() in PACE_CONFIG else "normal"
     min_poi, ideal_poi, max_poi = PACE_CONFIG[pace_key]
-
-    # Untuk trip panjang (5+ hari), kurangi sedikit agar tidak terlalu melelahkan
+    
     if num_days >= 5:
         ideal_poi = max(min_poi, ideal_poi - 1)
 
-    # Jumlah sesi makan:
-    # - pace santai: 1 makan siang (sarapan dan makan malam di hotel)
-    # - pace normal/padat: 1 makan siang + 1 makan malam (atau sarapan luar)
-    meals = 1 if pace_key == "santai" else 2
-
     return {
         "attractions_per_day": ideal_poi,
-        "meals_per_day": meals,
-        "total_places_per_day": ideal_poi + meals,
-        "fetch_buffer_multiplier": 3,  # Fetch 3x lebih banyak dari DB untuk ranking
+        "meals_per_day": 1 if pace_key == "santai" else 2,
         "pace_label": pace_key,
         "min_attractions": min_poi,
         "max_attractions": max_poi,
+        "daily_targets": daily_targets_str,
+        "was_capped": was_capped
     }
+
 
 
 async def extract_trip_parameters_from_message(message: str, db_districts: list[str]) -> dict:
@@ -303,7 +319,7 @@ async def extract_trip_parameters_from_message(message: str, db_districts: list[
             "   * Choose 'chat' for general greetings or questions.\n"
             "- pace: string, one of 'santai', 'padat', 'normal'.\n"
             "- is_half_day: boolean, true if half-day trip.\n"
-            "- user_requested_pois: integer or null.\n"
+            "- user_requested_pois: object mapping day numbers (strings) to integer counts (e.g., {\"1\": 4, \"2\": 3}) IF the user specifies different amounts per day. If they specify a single amount for all days, return an integer. Otherwise, return null.\n"
             "- detected_location: string or null.\n"
             "- normalized_districts: list of strings matching this allowed list:\n"
             f"{db_districts}\n\n"
@@ -326,9 +342,7 @@ async def extract_trip_parameters_from_message(message: str, db_districts: list[
         is_half_day = bool(data.get("is_half_day", False))
         
         user_requested_pois = data.get("user_requested_pois")
-        if user_requested_pois is not None:
-            try: user_requested_pois = int(user_requested_pois)
-            except: user_requested_pois = None
+        # user_requested_pois can now be an int, a dict, or None
                 
         detected_location = data.get("detected_location")
         if detected_location: detected_location = str(detected_location).strip()
@@ -1082,6 +1096,7 @@ async def get_smart_recommendations(
     category: str = "poi",
     preference_mode: str = "standard",
     user_detected_location: str = None,
+    user_requested_pois: Optional[dict] = None,
 ) -> list[dict]:
     """
     Cari tempat wisata menggunakan Radius & Anchor-First clustering.
@@ -1107,7 +1122,27 @@ async def get_smart_recommendations(
             num_days=num_days,
             user_detected_location=user_detected_location,
             preference_mode=preference_mode,
+            user_requested_pois=user_requested_pois,
         )
+
+
+async def get_general_recommendations(
+    query: str,
+    category: str = "poi",
+    limit: int = 5,
+) -> list[dict]:
+    """
+    Gunakan tool ini HANYA untuk rekomendasi tempat umum tanpa membuat itinerary.
+    """
+    if category == "hotel":
+        raw = await supabase_service.search_amenities_semantic(query, "hotel", limit=limit * 4)
+        return rank_pois_by_topsis(raw, category="hotel", preference_mode="standard", top_n=limit)
+    elif category == "restaurant":
+        raw = await supabase_service.search_amenities_semantic(query, "restaurant", limit=limit * 4)
+        return rank_pois_by_topsis(raw, category="restaurant", preference_mode="standard", top_n=limit)
+    else:
+        raw = await supabase_service.search_pois_semantic(query=query, limit=limit * 4)
+        return rank_pois_by_topsis(raw, category="poi", preference_mode="standard", top_n=limit)
 
 
 async def search_specific_place(query: str, category: str = "attraction") -> dict:
@@ -1198,6 +1233,7 @@ async def get_inspiration_narration(query: str, limit: int = 3) -> list[dict]:
 AVAILABLE_FUNCTIONS = {
     "get_bali_context": get_bali_context,
     "get_smart_recommendations": get_smart_recommendations,
+    "get_general_recommendations": get_general_recommendations,
     "search_specific_place": search_specific_place,
     "search_specific_place_nearby": search_specific_place_nearby,
     "get_nearby_places": get_nearby_places,
@@ -1237,7 +1273,15 @@ OPENAI_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Kata kunci tema wisata (misal: 'pantai sunset', 'budaya ubud')"},
+                    "query": {
+                        "type": "string", 
+                        "description": (
+                            "WAJIB LAKUKAN QUERY TRANSFORMATION! Jangan masukkan kalimat percakapan user secara mentah. "
+                            "Ubah permintaan user menjadi 3-6 kata kunci deskriptif (semantic vibe) yang padat makna untuk pencarian database vektor. "
+                            "Contoh: Jika user minta 'tolong cariin pantai yang bagus buat sunset di kuta', ubah query menjadi 'pantai pasir putih ombak sunset kuta bali'. "
+                            "Pastikan nama daerah (misal: kuta, ubud) selalu ikut dimasukkan ke dalam query jika user menyebutkannya."
+                        )
+                    },
                     "num_days": {"type": "integer", "description": "Jumlah hari perjalanan. WAJIB sesuai permintaan user."},
                     "category": {"type": "string", "enum": ["poi", "hotel", "restaurant"]},
                     "preference_mode": {
@@ -1248,6 +1292,27 @@ OPENAI_TOOLS = [
                         "type": "string",
                         "description": "District/area Bali yang disebutkan user (misal: 'Ubud', 'Kuta'). Opsional."
                     }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_general_recommendations",
+            "description": (
+                "Gunakan tool ini HANYA untuk rekomendasi tempat umum tanpa membuat itinerary. "
+                "WAJIB LAKUKAN QUERY TRANSFORMATION! Ubah ke frasa deskriptif (maks 15 kata). "
+                "EDGE CASE HANDLING: Jika user bertanya terlalu luas (misal: 'tempat bagus'), tambahkan kata kunci default seperti 'wisata populer indah bali'. "
+                "Jika hasil dari database kosong, JANGAN mengarang tempat palsu."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Kata kunci semantic (vibe) dan daerah."},
+                    "category": {"type": "string", "enum": ["poi", "hotel", "restaurant"]},
+                    "limit": {"type": "integer", "description": "Jumlah rekomendasi (default 5)"}
                 },
                 "required": ["query"]
             }
@@ -2041,10 +2106,23 @@ async def chat_with_heidi(
 
         active_tools = []
         if intent == "create":
+            alert_instruction = ""
+            if poi_budget.get("was_capped", False):
+                alert_instruction = (
+                    "⚠️ PERINGATAN EDGE CASE (PENTING): Permintaan jumlah tempat wisata (atraksi) per hari dari user terlalu besar "
+                    "dan tidak realistis untuk diselesaikan dalam satu hari, sehingga sistem telah membatasinya menjadi "
+                    "maksimal 7 atraksi per hari. KAMU WAJIB secara eksplisit dan sopan memberi tahu user di dalam "
+                    "narasi `message_to_user` bahwa jumlah atraksi telah dikurangi/dibatasi demi kenyamanan perjalanan "
+                    "mereka (agar tidak terlalu lelah dan memiliki waktu kunjungan yang cukup)."
+                )
+
             replacements.update({
                 "PACE": poi_budget.get('pace_label', 'normal'),
                 "ATTRACTIONS_COUNT": poi_budget.get('attractions_per_day', 4),
                 "PREFERENCE_MODE": preference_mode,
+                "DAILY_POI_TARGETS": poi_budget.get('daily_targets', 'Default'),
+                "NUM_DAYS_HINT": num_days_hint,
+                "CAPPED_POI_ALERT_INSTRUCTION": alert_instruction
             })
             system_prompt = load_prompt_from_md("creator_agent.md", replacements)
             allowed_names = ["get_bali_context", "get_smart_recommendations", "validate_itinerary_safety", "get_nearby_places"]
@@ -2123,7 +2201,7 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
                 mode_instruction = f"""
 ## MODE: GENERAL (Langsung Proses)
 - Jika user MENYAPA atau NGOBROL BIASA: response_type="chat". JANGAN panggil tool.
-- Jika user HANYA MINTA REKOMENDASI tanpa jadwal: panggil get_smart_recommendations, response_type="recommendation".
+- Jika user HANYA MINTA REKOMENDASI tanpa jadwal: panggil get_general_recommendations, response_type="recommendation".
 - Jika user MINTA ITINERARY LENGKAP → lanjut ke alur pembuatan.
   Jika tidak ada tanggal → asumsikan besok ({tomorrow_str}).
   Jika tidak ada durasi → asumsikan 1-2 hari.
@@ -2152,9 +2230,11 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
                 "WORKFLOW_INSTRUCTION": workflow_instruction,
             })
             system_prompt = load_prompt_from_md("chatter_agent.md", replacements)
-            allowed_names = ["search_specific_place", "get_inspiration_narration"]
+            allowed_names = ["search_specific_place", "get_inspiration_narration", "get_general_recommendations"]
             active_tools = [tool for tool in OPENAI_TOOLS if tool["function"]["name"] in allowed_names]
 
+        generated_schedule = None
+        captured_date_start = None
         messages = [{"role": "system", "content": system_prompt}]
         active_session_id = None
 
@@ -2186,6 +2266,7 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
             AI_TIMEOUT_SECONDS = 120
 
             async def _run_ai_loop() -> str:
+                nonlocal generated_schedule, captured_date_start
                 loop_count = 0
                 _raw_text = ""
 
@@ -2220,18 +2301,48 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
 
                             try:
                                 func_args = json.loads(tool_call.function.arguments)
+                                
+                                # Capture date_start from get_bali_context to align calendar dates
+                                if func_name == "get_bali_context" and "date_start" in func_args:
+                                    captured_date_start = func_args["date_start"]
+                                    logger.info(f"Captured start date from get_bali_context: {captured_date_start}")
+                                
+                                # Inject user_requested_pois if calling get_smart_recommendations for POI category
+                                if func_name == "get_smart_recommendations" and func_args.get("category", "poi") == "poi":
+                                    if "user_requested_pois" not in func_args and trip_params.get("user_requested_pois"):
+                                        func_args["user_requested_pois"] = trip_params["user_requested_pois"]
+                                
                                 logger.info(f"OpenAI panggil: {func_name}({func_args})")
                                 func_result = await func_to_call(**func_args)
+                                
+                                # Capture the generated schedule and convert it to stringified summary for LLM
+                                if func_name == "get_smart_recommendations" and func_args.get("category", "poi") == "poi":
+                                    generated_schedule = func_result  # Keep the raw built days schedule list
+                                    
+                                    # Create a clean text summary of the generated schedule
+                                    summary_lines = ["Berikut adalah jadwal harian yang telah disusun secara otomatis oleh backend Python untuk kamu:"]
+                                    for day_data in func_result:
+                                        summary_lines.append(f"\nHari {day_data.get('day')} (Tema: {day_data.get('theme', 'Eksplorasi')}):")
+                                        for p in day_data.get("places", []):
+                                            summary_lines.append(
+                                                f"  - {p.get('visit_time')} ({p.get('visit_duration_mins')} mnt): {p.get('name')} "
+                                                f"[{p.get('category')}]. Deskripsi: {p.get('description')}. Tips: {p.get('tips')}. Cost: Rp {p.get('estimated_cost_idr'):,} per orang."
+                                            )
+                                    summary_text = "\n".join(summary_lines)
+                                    logger.info("Interception: get_smart_recommendations output summarized for LLM.")
+                                    tool_content = summary_text
+                                else:
+                                    tool_content = json.dumps(func_result, default=str)
+                                    
                             except Exception as e:
-                                # Log full detail server-side; return sanitized error to AI
                                 logger.error(f"Error pada {func_name}: {e}", exc_info=True)
-                                func_result = {"error": "Tool execution failed."}
+                                tool_content = json.dumps({"error": "Tool execution failed."})
 
                             messages.append({
                                 "tool_call_id": tool_call.id,
                                 "role": "tool",
                                 "name": func_name,
-                                "content": json.dumps(func_result, default=str)
+                                "content": tool_content
                             })
                     else:
                         _raw_text = response_message.content
@@ -2274,24 +2385,59 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
             raw_text = json.dumps(parsed_data.model_dump(), default=str)
 
         # --- POST-PROCESSING (hanya untuk itinerary) ---
-        if parsed_data.response_type == "itinerary" and parsed_data.itinerary_days:
+        if parsed_data.response_type == "itinerary":
+
+            if generated_schedule:
+                logger.info("INJECTION: Injecting generated_schedule into parsed_data.itinerary_days")
+                
+                # Align dates based on captured_date_start
+                start_date_val = datetime.now() + timedelta(days=1)
+                if captured_date_start:
+                    try:
+                        start_date_val = datetime.strptime(captured_date_start, "%Y-%m-%d")
+                    except Exception:
+                        pass
+                
+                injected_days = []
+                for day_data in generated_schedule:
+                    day_num = day_data.get("day", 1)
+                    formatted_date = (start_date_val + timedelta(days=day_num - 1)).strftime("%Y-%m-%d")
+                    
+                    places_list = []
+                    for p in day_data.get("places", []):
+                        places_list.append(PlaceItem(**p))
+                        
+                    injected_days.append(DailyItinerary(
+                        day=day_num,
+                        date=formatted_date,
+                        theme=day_data.get("theme"),
+                        places=places_list,
+                        day_total_distance_km=None,
+                        day_total_travel_time_mins=None,
+                        day_full_polyline=None,
+                        route_from_hotel=None,
+                        odalan_warning=None,
+                        weather_note=None
+                    ))
+                parsed_data.itinerary_days = injected_days
 
             # REPAIR: Deteksi jika semua hari punya places kosong (model skip JSON population)
-            all_empty = all(
-                not day.places
-                for day in parsed_data.itinerary_days
-            )
-            if all_empty:
-                logger.warning("REPAIR TRIGGERED: Semua days punya places:[] kosong. Menjalankan repair...")
-                raw_dict = json.loads(raw_text)
-                raw_dict = sanitize_ai_output(raw_dict)
-                raw_dict = await repair_empty_places(raw_dict, messages)
-                raw_dict = sanitize_ai_output(raw_dict)  # sanitize ulang setelah repair
-                try:
-                    parsed_data = FinalAIResponse.model_validate(raw_dict)
-                except Exception as val_err:
-                    logger.error(f"REPAIR: Validasi setelah repair gagal: {val_err}")
-                    # Lanjut dengan data asli (lebih baik kosong daripada error)
+            if parsed_data.itinerary_days:
+                all_empty = all(
+                    not day.places
+                    for day in parsed_data.itinerary_days
+                )
+                if all_empty:
+                    logger.warning("REPAIR TRIGGERED: Semua days punya places:[] kosong. Menjalankan repair...")
+                    raw_dict = json.loads(raw_text)
+                    raw_dict = sanitize_ai_output(raw_dict)
+                    raw_dict = await repair_empty_places(raw_dict, messages)
+                    raw_dict = sanitize_ai_output(raw_dict)  # sanitize ulang setelah repair
+                    try:
+                        parsed_data = FinalAIResponse.model_validate(raw_dict)
+                    except Exception as val_err:
+                        logger.error(f"REPAIR: Validasi setelah repair gagal: {val_err}")
+                        # Lanjut dengan data asli (lebih baik kosong daripada error)
 
             # Deteksi district dari raw_text dan pesan user
             district_hint = extract_district_hint(raw_text, req.message)
@@ -2300,20 +2446,54 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
             # 1. HOTEL GUARANTEE — Pastikan base_hotel selalu ada
             parsed_data = await guarantee_base_hotel(parsed_data, district_hint, preference_mode)
 
-            # 2. COORDINATE ENRICHMENT — Jika AI lupa isi lat/lng, backend ambil dari DB via place_id
-            parsed_data = await enrich_place_coordinates(parsed_data)
+            # 2. BUDGET RECALCULATION — Calculate deterministically based on injected itinerary and guaranteed hotel
+            if parsed_data.itinerary_days:
+                num_days = len(parsed_data.itinerary_days)
+                num_nights = max(1, num_days - 1)
+                hotel_price = 850000
+                if parsed_data.base_hotel and parsed_data.base_hotel.price_per_night_idr:
+                    hotel_price = parsed_data.base_hotel.price_per_night_idr
+                
+                accommodation_idr = hotel_price * num_nights
+                
+                food_resto_cost = 0
+                for day in parsed_data.itinerary_days:
+                    for p in day.places:
+                        if p.category == "restaurant" and p.estimated_cost_idr:
+                            food_resto_cost += p.estimated_cost_idr
+                food_idr = food_resto_cost * 2 + 50000 * 2 * num_days
+                
+                transport_idr = 150000 * num_days
+                
+                entrance_fee_cost = 0
+                for day in parsed_data.itinerary_days:
+                    for p in day.places:
+                        if p.category == "attraction" and p.estimated_cost_idr:
+                            entrance_fee_cost += p.estimated_cost_idr
+                entrance_fee_idr = entrance_fee_cost * 2
+                
+                miscellaneous_idr = int((accommodation_idr + food_idr + transport_idr + entrance_fee_idr) * 0.12)
+                total_budget_idr = accommodation_idr + food_idr + transport_idr + entrance_fee_idr + miscellaneous_idr
+                
+                parsed_data.budget_breakdown = BudgetBreakdown(
+                    accommodation_idr=accommodation_idr,
+                    food_idr=food_idr,
+                    transport_idr=transport_idr,
+                    entrance_fee_idr=entrance_fee_idr,
+                    miscellaneous_idr=miscellaneous_idr
+                )
+                parsed_data.total_budget_idr = total_budget_idr
+                logger.info(f"Budget recalculated: Total={total_budget_idr}")
 
-            # 3. MEAL SCHEDULING — v9.0: Handled by Heidi AI
-            # Restaurants are delivered in the per-day pool from
-            # generate_clustered_pool_delivery. AI places them at
-            # Lunch (12:00-13:30) and Dinner (18:30-20:00).
+            # 3. COORDINATE ENRICHMENT — Jika AI lupa isi lat/lng, backend ambil dari DB via place_id
+            parsed_data = await enrich_place_coordinates(parsed_data)
 
             # 4. ROUTING INJECTION — Backend hitung rute (tidak berubah dari v7)
             hotel = parsed_data.base_hotel
             hotel_lat = hotel.latitude if hotel else None
             hotel_lng = hotel.longitude if hotel else None
 
-            for day in parsed_data.itinerary_days:
+            for day in (parsed_data.itinerary_days or []):
                 waypoints = []
                 if hotel_lat is not None and hotel_lng is not None:
                     waypoints.append({"lat": hotel_lat, "lng": hotel_lng, "name": hotel.name})

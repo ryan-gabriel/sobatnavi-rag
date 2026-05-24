@@ -417,6 +417,7 @@ async def generate_clustered_pool_delivery(
     num_days: int,
     user_detected_location: Optional[str] = None,
     preference_mode: str = "standard",
+    user_requested_pois: Optional[dict] = None,
 ) -> list[dict]:
     """
     Radius & Anchor-First clustering engine.
@@ -679,4 +680,204 @@ async def generate_clustered_pool_delivery(
         f"{len(global_used_ids)} unique IDs tracked"
     )
 
-    return daily_pools
+    structured_itinerary = build_deterministic_itinerary(daily_pools, user_requested_pois)
+    return structured_itinerary
+
+
+def map_to_place_item(item: dict, category: str, visit_time: str, visit_duration: int) -> dict:
+    meta = item.get("metadata") or {}
+    if isinstance(meta, str):
+        import json
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+            
+    desc = item.get("content") or item.get("description")
+    if not desc and meta:
+        desc = meta.get("description") or meta.get("content")
+    if not desc:
+        parts = [f"{item.get('name', 'Tempat')}"]
+        if item.get("district"):
+            parts.append(f"berlokasi di {item.get('district')}")
+        if item.get("rating"):
+            parts.append(f"dengan rating {item.get('rating')}/5")
+        desc = ". ".join(parts) + "."
+
+    est_cost = item.get("estimated_cost_idr")
+    if est_cost is None:
+        if category == "restaurant":
+            pl = item.get("price_level") or meta.get("price_level") or meta.get("priceLevel") or "PRICE_LEVEL_MODERATE"
+            price_map = {
+                "PRICE_LEVEL_FREE": 0,
+                "PRICE_LEVEL_INEXPENSIVE": 50000,
+                "PRICE_LEVEL_MODERATE": 100000,
+                "PRICE_LEVEL_EXPENSIVE": 250000,
+                "PRICE_LEVEL_VERY_EXPENSIVE": 500000,
+            }
+            if isinstance(pl, int):
+                price_map_num = {0: 0, 1: 50000, 2: 120000, 3: 250000, 4: 500000}
+                est_cost = price_map_num.get(pl, 120000)
+            else:
+                est_cost = price_map.get(pl, 120000)
+        else:
+            pl = item.get("price_level") or meta.get("price_level") or meta.get("priceLevel")
+            if pl:
+                price_map = {
+                    "PRICE_LEVEL_FREE": 0,
+                    "PRICE_LEVEL_INEXPENSIVE": 15000,
+                    "PRICE_LEVEL_MODERATE": 35000,
+                    "PRICE_LEVEL_EXPENSIVE": 75000,
+                    "PRICE_LEVEL_VERY_EXPENSIVE": 150000,
+                }
+                est_cost = price_map.get(pl, 25000)
+            else:
+                est_cost = 25000
+
+    tags = item.get("tags") or meta.get("tags")
+    if not tags:
+        if category == "restaurant":
+            tags = ["kuliner", "makanan", "restoran"]
+            if item.get("district"):
+                tags.append(item.get("district").lower())
+        else:
+            tags = ["wisata", "atraksi", "populer"]
+            if item.get("district"):
+                tags.append(item.get("district").lower())
+    elif isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    tips = item.get("tips") or meta.get("tips")
+    if not tips:
+        if category == "restaurant":
+            tips = f"Coba menu andalan di {item.get('name')} untuk pengalaman kuliner terbaik."
+        else:
+            tips = f"Bawa kamera terbaikmu untuk mengabadikan momen indah di {item.get('name')}."
+
+    return {
+        "place_id": item.get("place_id"),
+        "poi_id": str(item.get("id")) if item.get("id") is not None else (str(item.get("poi_id")) if item.get("poi_id") is not None else None),
+        "name": item.get("name"),
+        "category": "restaurant" if category == "restaurant" else "attraction",
+        "description": desc,
+        "latitude": item.get("latitude"),
+        "longitude": item.get("longitude"),
+        "district": item.get("district"),
+        "image_url": item.get("image_url"),
+        "rating": item.get("rating"),
+        "user_rating_count": item.get("user_rating_count"),
+        "estimated_cost_idr": est_cost,
+        "tags": tags,
+        "visit_duration_mins": visit_duration,
+        "visit_time": visit_time,
+        "opening_hours_note": item.get("opening_hours_note") or meta.get("opening_hours_note") or meta.get("openingHours"),
+        "tips": tips,
+        "route_to_next": None
+    }
+
+
+def build_deterministic_itinerary(daily_pools: list[dict], user_requested_pois: Optional[dict] = None) -> list[dict]:
+    itinerary_days = []
+    
+    for day_pool in daily_pools:
+        day_num = day_pool["day"]
+        pois = day_pool["pois"]
+        restaurants = day_pool["restaurants"]
+        
+        # 1. Determine target count of attractions
+        target_count = 3
+        if isinstance(user_requested_pois, dict):
+            target_count = user_requested_pois.get(str(day_num)) or user_requested_pois.get(day_num) or 3
+        elif isinstance(user_requested_pois, int):
+            target_count = user_requested_pois
+        try:
+            target_count = max(1, min(int(target_count), 7))
+        except (ValueError, TypeError):
+            target_count = 3
+            
+        selected_pois = pois[:target_count]
+        
+        # 2. Select restaurants
+        if not restaurants:
+            # Fallback placeholder restaurant
+            fallback_resto = {
+                "place_id": None,
+                "name": "Restoran Lokal Bali",
+                "latitude": day_pool["anchor"]["lat"],
+                "longitude": day_pool["anchor"]["lng"],
+                "district": day_pool["anchor"].get("name", "Bali"),
+                "rating": 4.5,
+                "content": "Menyajikan hidangan lokal khas Bali yang lezat dengan bahan segar.",
+                "metadata": {"price_level": "PRICE_LEVEL_MODERATE"}
+            }
+            restaurants = [fallback_resto, fallback_resto]
+            
+        lunch_resto = restaurants[0]
+        dinner_resto = restaurants[1] if len(restaurants) > 1 else restaurants[0]
+        
+        # 3. Schedule places chronologically
+        places = []
+        if len(selected_pois) == 0:
+            # No POIs, should not happen, but safeguard
+            # Just add lunch and dinner
+            l_item = map_to_place_item(lunch_resto, "restaurant", "12:00", 60)
+            d_item = map_to_place_item(dinner_resto, "restaurant", "18:30", 60)
+            places.extend([l_item, d_item])
+        elif len(selected_pois) == 1:
+            p1 = map_to_place_item(selected_pois[0], "attraction", "09:30", 90)
+            l_item = map_to_place_item(lunch_resto, "restaurant", "12:00", 60)
+            d_item = map_to_place_item(dinner_resto, "restaurant", "18:30", 60)
+            places.extend([p1, l_item, d_item])
+        elif len(selected_pois) == 2:
+            p1 = map_to_place_item(selected_pois[0], "attraction", "09:00", 90)
+            l_item = map_to_place_item(lunch_resto, "restaurant", "12:00", 60)
+            p2 = map_to_place_item(selected_pois[1], "attraction", "14:30", 90)
+            d_item = map_to_place_item(dinner_resto, "restaurant", "18:30", 60)
+            places.extend([p1, l_item, p2, d_item])
+        else:
+            # 3 or more POIs
+            p1 = map_to_place_item(selected_pois[0], "attraction", "08:30", 90)
+            p2 = map_to_place_item(selected_pois[1], "attraction", "10:30", 60)
+            places.extend([p1, p2])
+            
+            l_item = map_to_place_item(lunch_resto, "restaurant", "12:00", 60)
+            places.append(l_item)
+            
+            afternoon_pois = selected_pois[2:]
+            num_aft = len(afternoon_pois)
+            for idx, poi in enumerate(afternoon_pois):
+                start_total_mins = 13 * 60 + 30 + int(idx * (270 / num_aft))
+                h = start_total_mins // 60
+                m = start_total_mins % 60
+                v_time = f"{h:02d}:{m:02d}"
+                v_dur = max(45, min(90, int(270 / num_aft) - 15))
+                p_aft = map_to_place_item(poi, "attraction", v_time, v_dur)
+                places.append(p_aft)
+                
+            d_item = map_to_place_item(dinner_resto, "restaurant", "18:30", 60)
+            places.append(d_item)
+            
+        # Determine theme based on attractions
+        districts = []
+        for p in places:
+            if p.get("category") == "attraction" and p.get("district"):
+                if p["district"] not in districts:
+                    districts.append(p["district"])
+        if districts:
+            theme = f"Eksplorasi {', '.join(districts[:2])}"
+        else:
+            theme = f"Petualangan Menarik Hari {day_num}"
+            
+        itinerary_days.append({
+            "day": day_num,
+            "theme": theme,
+            "places": places,
+            "day_total_distance_km": None,
+            "day_total_travel_time_mins": None,
+            "day_full_polyline": None,
+            "route_from_hotel": None,
+            "odalan_warning": None,
+            "weather_note": None
+        })
+        
+    return itinerary_days
