@@ -290,6 +290,89 @@ def calculate_poi_budget(
 
 
 
+def extract_number_of_days(durasi_str: str) -> Optional[int]:
+    if not durasi_str:
+        return None
+    match = re.search(r"(\d+)", str(durasi_str))
+    if match:
+        val = int(match.group(1))
+        return max(1, min(val, 14))
+    return None
+
+
+async def check_deep_research_variables(message: str, history: list[dict]) -> dict:
+    """
+    Menganalisis apakah 6 variabel penting sudah terisi dari chat history dan pesan saat ini.
+    """
+    try:
+        client = _get_client()
+        
+        # Serialize history into user/assistant conversation string
+        history_str = ""
+        for msg in history:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role and content:
+                history_str += f"{role.upper()}: {content}\n"
+        
+        system_prompt = (
+            "You are an information extraction assistant. Analyze the user's travel planning request and conversation history.\n"
+            "Your task is to check if the following 6 variables are provided/filled by the user:\n"
+            "1. lokasi (e.g., 'Ubud', 'Kuta', 'Seminyak')\n"
+            "2. tanggal (e.g., 'Besok', '12 Agustus', '2026-08-12')\n"
+            "3. durasi (e.g., '3 hari', '3 days', '1 minggu')\n"
+            "4. budget (e.g., 'Hemat', 'Menengah', 'Mewah', 'Budget', 'Luxury')\n"
+            "5. teman_perjalanan (e.g., 'Sendiri', 'Keluarga', 'Teman', 'Pasangan')\n"
+            "6. pace (e.g., 'Santai', 'Padat', 'Normal')\n\n"
+            "Return a JSON object with this exact structure:\n"
+            "{\n"
+            "  \"variables\": {\n"
+            "    \"lokasi\": string or null,\n"
+            "    \"tanggal\": string or null,\n"
+            "    \"durasi\": string or null,\n"
+            "    \"budget\": string or null,\n"
+            "    \"teman_perjalanan\": string or null,\n"
+            "    \"pace\": string or null\n"
+            "  },\n"
+            "  \"all_filled\": boolean,\n"
+            "  \"missing_variables\": [\"lokasi\", \"tanggal\", ...]\n"
+            "}\n\n"
+            "Rules:\n"
+            "- If a variable is mentioned in either the current message or the history, extract it.\n"
+            "- Do not guess or assume. If it is not clearly specified, set it to null.\n"
+            "- 'all_filled' should be true ONLY if all 6 variables are non-null."
+        )
+        
+        user_content = f"History:\n{history_str}\n\nCurrent Message: {message}"
+        
+        response = await client.chat.completions.create(
+            model=settings.openai_model_id,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=250
+        )
+        
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"Gagal mengekstrak variabel deep research: {e}")
+        return {
+            "variables": {
+                "lokasi": None,
+                "tanggal": None,
+                "durasi": None,
+                "budget": None,
+                "teman_perjalanan": None,
+                "pace": None
+            },
+            "all_filled": False,
+            "missing_variables": ["lokasi", "tanggal", "durasi", "budget", "teman_perjalanan", "pace"]
+        }
+
+
 async def extract_trip_parameters_from_message(message: str, db_districts: list[str]) -> dict:
     try:
         logger.info(">>> MENJALANKAN EXTRACT PARAMS <<<")
@@ -2005,6 +2088,141 @@ async def chat_with_heidi(
         db_districts = await supabase_service.get_db_districts()
         trip_params = await extract_trip_parameters_from_message(req.message, db_districts)
 
+        # --- PRE-COMPILE HISTORY FOR DEEP RESEARCH CHECK ---
+        active_session_id = None
+        db_history = []
+        history_for_checking = []
+        if is_authenticated:
+            active_session_id = await supabase_service.get_or_create_chat_session(user_id, req.session_id)
+            db_history = await supabase_service.get_chat_history(active_session_id)
+            for msg in db_history:
+                oai_role = "assistant" if msg["role"] in ["model", "assistant"] else "user"
+                history_for_checking.append({"role": oai_role, "content": msg["content"]})
+        else:
+            for msg in (req.history or []):
+                role = "assistant" if msg["role"] in ["model", "assistant"] else "user"
+                content = msg.get("parts", msg.get("content", ""))
+                history_for_checking.append({"role": role, "content": content})
+
+        num_days_hint = 2
+
+        # --- DEEP RESEARCH CHECK ---
+        dr_vars = None
+        if req.mode == "deep_research" and not is_editing:
+            dr_result = await check_deep_research_variables(req.message, history_for_checking)
+            logger.info(f"Deep Research variable check result: {dr_result}")
+            if not dr_result.get("all_filled", False):
+                # Format missing variables nicely for the prompt
+                missing_vars = dr_result.get("missing_variables", [])
+                indonesian_var_names = {
+                    "lokasi": "Lokasi (Contoh: Ubud, Kuta)",
+                    "tanggal": "Tanggal (Contoh: Besok, 12 Agustus)",
+                    "durasi": "Durasi (Contoh: 3 hari)",
+                    "budget": "Budget (Contoh: Hemat, Menengah)",
+                    "teman_perjalanan": "Teman Perjalanan (Contoh: Sendiri, Keluarga)",
+                    "pace": "Pace (Contoh: Santai, Padat)"
+                }
+                missing_vars_formatted = [indonesian_var_names.get(v, v) for v in missing_vars]
+                missing_vars_str = "\n".join([f"- {v}" for v in missing_vars_formatted])
+                
+                system_prompt = (
+                    "Kamu adalah **Heidi**, asisten perjalanan AI spesialis Bali dari SobatNavi.\n"
+                    "Kepribadianmu: hangat, informatif, sangat ramah, dan membantu.\n\n"
+                    "Saat ini kita sedang dalam mode Deep Research untuk merencanakan liburan terbaik di Bali.\n"
+                    "Namun, ada beberapa variabel penting yang masih kosong/belum diisi oleh user.\n\n"
+                    "Variabel yang MASIH KOSONG:\n"
+                    f"{missing_vars_str}\n\n"
+                    "Tugasmu:\n"
+                    "Tanyakan kepada user dengan cara yang ramah, hangat, dan interaktif (dalam Bahasa Indonesia) untuk melengkapi variabel yang masih kosong di atas.\n"
+                    "JANGAN membuat itinerary sekarang! Fokuslah hanya untuk menanyakan variabel yang belum terisi.\n"
+                    "Gunakan format markdown yang indah (seperti bold, list, emoji) di dalam pesanmu.\n\n"
+                    "Kamu WAJIB mengembalikan respon dalam format JSON murni dengan skema berikut:\n"
+                    "{\n"
+                    "  \"response_type\": \"clarifying\",\n"
+                    "  \"message_to_user\": \"Pesan ramah dalam markdown yang menanyakan variabel yang kurang.\",\n"
+                    "  \"suggested_replies\": [\n"
+                    "     \"3 contoh jawaban yang relevan dan singkat bagi user untuk melengkapi variabel tersebut.\"\n"
+                    "  ]\n"
+                    "}\n"
+                    "Kembalikan HANYA JSON objek tersebut."
+                )
+                
+                # Run the LLM to get the response
+                llm_messages = [{"role": "system", "content": system_prompt}]
+                for msg in history_for_checking:
+                    llm_messages.append(msg)
+                llm_messages.append({"role": "user", "content": req.message})
+                
+                client = _get_client()
+                response = await client.chat.completions.create(
+                    model=settings.openai_model_id,
+                    messages=llm_messages,
+                    response_format={"type": "json_object"},
+                    temperature=0.7,
+                )
+                raw_text = response.choices[0].message.content
+                raw_dict = json.loads(raw_text)
+                raw_dict = sanitize_ai_output(raw_dict)
+                parsed_data = FinalAIResponse.model_validate(raw_dict)
+                
+                # Save messages if authenticated
+                if is_authenticated:
+                    await supabase_service.save_chat_message(
+                        session_id=active_session_id,
+                        role="user",
+                        content=req.message,
+                    )
+                    await supabase_service.save_chat_message(
+                        session_id=active_session_id,
+                        role="assistant",
+                        content=raw_text,
+                    )
+                    if hasattr(parsed_data, "session_id"):
+                        parsed_data.session_id = active_session_id
+                else:
+                    if hasattr(parsed_data, "session_id"):
+                        parsed_data.session_id = req.session_id
+                
+                return parsed_data
+            else:
+                dr_vars = dr_result.get("variables", {})
+                
+                # Override parameters using extracted deep research variables
+                extracted_days = extract_number_of_days(dr_vars.get("durasi"))
+                if extracted_days:
+                    num_days_hint = extracted_days
+                
+                pace_val = dr_vars.get("pace")
+                if pace_val:
+                    pace_str = str(pace_val).lower()
+                    if "santai" in pace_str:
+                        trip_params["pace"] = "santai"
+                    elif "padat" in pace_str or "cepat" in pace_str:
+                        trip_params["pace"] = "padat"
+                    else:
+                        trip_params["pace"] = "normal"
+                
+                lokasi_val = dr_vars.get("lokasi")
+                if lokasi_val:
+                    trip_params["detected_location"] = lokasi_val
+                    det_low = lokasi_val.lower()
+                    matches = [db_d for db_d in db_districts if det_low in db_d.lower() or db_d.lower() in det_low]
+                    if matches:
+                        trip_params["normalized_districts"] = matches
+                        
+                budget_val = dr_vars.get("budget")
+                if budget_val:
+                    budget_str = str(budget_val).lower()
+                    if any(x in budget_str for x in ["hemat", "murah", "backpacker", "budget"]):
+                        req.budget_preference = "budget"
+                    elif any(x in budget_str for x in ["mewah", "luxury", "sultan", "mahal"]):
+                        req.budget_preference = "luxury"
+                    else:
+                        req.budget_preference = "moderate"
+                
+                # Force intent to create so it generates the itinerary
+                trip_params["intent"] = "create"
+
         if trip_params.get("intent") in ["add_place", "delete_place", "swap_place"] and not is_editing:
             return FinalAIResponse(
                 response_type="chat",
@@ -2060,10 +2278,10 @@ async def chat_with_heidi(
                 supabase_service._normalization_cache[nd.lower()] = trip_params["normalized_districts"]
         # Deteksi jumlah hari dari history / pesan untuk kalkulasi budget
         # Default ke 2 hari; AI yang nanti menentukan secara akurat
-        num_days_hint = 2
-        day_match = re.search(r"(\d+)\s*(hari|days?|malam|night)", req.message.lower())
-        if day_match:
-            num_days_hint = max(1, min(int(day_match.group(1)), 14))
+        if not (req.mode == "deep_research" and dr_vars):
+            day_match = re.search(r"(\d+)\s*(hari|days?|malam|night)", req.message.lower())
+            if day_match:
+                num_days_hint = max(1, min(int(day_match.group(1)), 14))
 
         poi_budget = calculate_poi_budget(
             num_days=num_days_hint,
@@ -2110,6 +2328,25 @@ async def chat_with_heidi(
                 "CAPPED_POI_ALERT_INSTRUCTION": alert_instruction
             })
             system_prompt = load_prompt_from_md("creator_agent.md", replacements)
+            
+            # Inject deep research context if applicable
+            if req.mode == "deep_research" and dr_vars:
+                deep_research_context = (
+                    "\n\n## DEEP RESEARCH CONTEXT (PENTING)\n"
+                    "Kamu sedang membuat itinerary dalam mode **Deep Research**. Gunakan preferensi perjalanan berikut "
+                    "yang sudah dikonfirmasi oleh user untuk menyusun itinerary secara lebih detail, relevan, dan terpersonalisasi:\n"
+                    f"- **Lokasi Utama**: {dr_vars.get('lokasi')}\n"
+                    f"- **Tanggal Mulai**: {dr_vars.get('tanggal')}\n"
+                    f"- **Durasi**: {dr_vars.get('durasi')}\n"
+                    f"- **Budget Preference**: {dr_vars.get('budget')}\n"
+                    f"- **Teman Perjalanan**: {dr_vars.get('teman_perjalanan')}\n"
+                    f"- **Pace**: {dr_vars.get('pace')}\n\n"
+                    "Pastikan pilihan tempat wisata, restoran, dan hotel benar-benar sesuai dengan teman perjalanan "
+                    f"({dr_vars.get('teman_perjalanan')}), budget ({dr_vars.get('budget')}), dan pace ({dr_vars.get('pace')}). "
+                    "Jelaskan di narasi `message_to_user` mengapa pilihan ini cocok untuk kelompok perjalanan tersebut."
+                )
+                system_prompt += deep_research_context
+
             allowed_names = ["get_bali_context", "get_smart_recommendations", "validate_itinerary_safety", "get_nearby_places"]
             active_tools = [tool for tool in OPENAI_TOOLS if tool["function"]["name"] in allowed_names]
         else:
@@ -2225,8 +2462,6 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
 
         # --- MANAJEMEN HISTORY ---
         if is_authenticated:
-            active_session_id = await supabase_service.get_or_create_chat_session(user_id, req.session_id)
-            db_history = await supabase_service.get_chat_history(active_session_id)
             for msg in db_history:
                 oai_role = "assistant" if msg["role"] in ["model", "assistant"] else "user"
                 messages.append({"role": oai_role, "content": msg["content"]})
