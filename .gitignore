@@ -5,3 +5,5 @@ tests/
 
 .vscode/
 __pycache__/
+
+docs/
