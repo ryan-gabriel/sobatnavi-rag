@@ -2462,6 +2462,7 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
 
         # --- MANAJEMEN HISTORY ---
         if is_authenticated:
+            active_session_id = await supabase_service.get_or_create_chat_session(user_id, req.session_id)
             for msg in db_history:
                 oai_role = "assistant" if msg["role"] in ["model", "assistant"] else "user"
                 messages.append({"role": oai_role, "content": msg["content"]})
