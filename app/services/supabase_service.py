@@ -114,15 +114,16 @@ class SupabaseService:
         try:
             oai = _get_openai_client()
             prompt = (
-                "You are an expert travel assistant for Bali.\n"
-                "Given a user-provided location name (which might have typos, spelling mistakes, or refer to a sub-district, village, beach, landmark, or regency),\n"
-                "map it to all relevant database district/location names from this allowed list:\n"
+                "Kamu adalah asisten pemetaan geografis ahli untuk Bali.\n"
+                "Diberikan nama lokasi dari pengguna (bisa berupa kecamatan, desa, pantai, tengara/landmark, atau Kabupaten),\n"
+                "tugasmu adalah memetakannya SECARA KETAT ke Kabupaten induknya dari daftar yang diizinkan berikut:\n"
                 f"{db_districts}\n\n"
-                "Rules:\n"
-                "1. Connect the input to any regencies it belongs to, and any matching beaches, landmarks, or streets in the allowed list.\n"
-                "2. Gracefully handle typos or phonetic spelling variations.\n"
-                "3. Return a JSON object with exactly one key: 'normalized' containing a list of the matching database names.\n"
-                "Return ONLY the raw JSON object. No markdown, no backticks, no explanations."
+                "Aturan:\n"
+                "1. Jika input sudah berupa Kabupaten dari daftar, kembalikan nama tersebut.\n"
+                "2. Jika input adalah kecamatan, desa, pantai, atau landmark (misal: 'Ubud', 'Kuta', 'Seminyak', 'Canggu', 'Uluwatu', 'Nusa Penida'), kamu WAJIB memetakannya ke Kabupaten induknya (misal: 'Ubud' -> 'Gianyar', 'Kuta/Seminyak/Canggu' -> 'Badung', 'Nusa Penida' -> 'Klungkung').\n"
+                "3. Tangani salah ketik (typo) atau variasi ejaan dengan baik.\n"
+                "4. Kembalikan HANYA objek JSON dengan tepat satu key: 'normalized' yang berisi list nama Kabupaten induk yang cocok dari daftar yang diizinkan.\n"
+                "Kembalikan HANYA objek JSON mentah. Tanpa markdown, tanpa backticks, tanpa penjelasan."
             )
             
             response = await oai.chat.completions.create(
@@ -187,10 +188,16 @@ class SupabaseService:
             )
             query_embedding = response.data[0].embedding
 
+            db_district_to_use = None
+            if filter_district:
+                normalized_districts = await self._normalize_district_names(filter_district)
+                if normalized_districts:
+                    db_district_to_use = normalized_districts[0]
+
             rpc_params = {
                 "query_embedding": query_embedding,
-                "match_count": max(limit * 4, 100) if filter_district else limit,
-                "filter_district": None,  # Matikan filter district di RPC agar bisa difilter di Python
+                "match_count": limit,
+                "filter_district": db_district_to_use,
                 "filter_category": filter_category,
                 "filter_price_level": filter_price_level,
                 "filter_min_rating": filter_min_rating,
@@ -202,27 +209,7 @@ class SupabaseService:
             result = await asyncio.to_thread(_fetch)
             data = result.data or []
             
-            if filter_district:
-                normalized_districts = await self._normalize_district_names(filter_district)
-                filtered_data = [
-                    poi for poi in data
-                    if poi.get("district") in normalized_districts
-                ]
-                logger.info(
-                    f"District filter '{filter_district}' mapped to {normalized_districts}. "
-                    f"Filtered {len(data)} results down to {len(filtered_data)}."
-                )
-                if len(filtered_data) >= 3:
-                    data = filtered_data[:limit]
-                else:
-                    logger.warning(
-                        f"Python district filtering for '{filter_district}' yielded only {len(filtered_data)} results. "
-                        f"Falling back to unfiltered global semantic results to prevent empty pool."
-                    )
-                    data = data[:limit]
-            else:
-                logger.info(f"Semantic search '{query}': {len(data)} hasil")
-                
+            logger.info(f"Semantic search '{query}' di distrik '{db_district_to_use}': {len(data)} hasil")
             return data
 
         except Exception as e:

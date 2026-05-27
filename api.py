@@ -2528,10 +2528,19 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
                                     captured_date_start = func_args["date_start"]
                                     logger.info(f"Captured start date from get_bali_context: {captured_date_start}")
                                 
-                                # Inject user_requested_pois if calling get_smart_recommendations for POI category
-                                if func_name == "get_smart_recommendations" and func_args.get("category", "poi") == "poi":
-                                    if "user_requested_pois" not in func_args and poi_budget.get("full_targets"):
-                                        func_args["user_requested_pois"] = poi_budget["full_targets"]
+                                # Force inject parameters to prevent AI from forgetting optional filters
+                                if func_name == "get_smart_recommendations":
+                                    if func_args.get("category", "poi") == "poi":
+                                        if "user_requested_pois" not in func_args and poi_budget.get("full_targets"):
+                                            func_args["user_requested_pois"] = poi_budget["full_targets"]
+                                    
+                                    if trip_params.get("detected_location"):
+                                        func_args["user_detected_location"] = trip_params["detected_location"]
+                                        logger.info(f"Interception: Force injected user_detected_location={func_args['user_detected_location']}")
+
+                                if func_name == "get_bali_context":
+                                    if trip_params.get("detected_location"):
+                                        func_args["district"] = trip_params["detected_location"]
                                 
                                 logger.info(f"OpenAI panggil: {func_name}({func_args})")
                                 func_result = await func_to_call(**func_args)
