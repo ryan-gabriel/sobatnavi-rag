@@ -1377,8 +1377,8 @@ OPENAI_TOOLS = [
             "description": (
                 "Gunakan tool ini HANYA untuk rekomendasi tempat umum tanpa membuat itinerary. "
                 "WAJIB LAKUKAN QUERY TRANSFORMATION! Ubah ke frasa deskriptif (maks 15 kata). "
-                "EDGE CASE HANDLING: Jika user bertanya terlalu luas (misal: 'tempat bagus'), tambahkan kata kunci default seperti 'wisata populer indah bali'. "
-                "Jika hasil dari database kosong, JANGAN mengarang tempat palsu."
+                "WARNING: Vector search akan selalu mengembalikan tempat (false positives) meskipun kueri mustahil ada di Bali (spt: salju). "
+                "EVALUASI hasilnya secara logis sebelum merespons user! Jika hasil tidak relevan dengan kueri, jujurlah bahwa hal itu tidak ada di Bali dan jadikan hasilnya sebagai alternatif."
             ),
             "parameters": {
                 "type": "object",
