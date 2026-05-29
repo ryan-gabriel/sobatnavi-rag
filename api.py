@@ -2319,11 +2319,10 @@ async def chat_with_heidi(
             alert_instruction = ""
             if poi_budget.get("was_capped", False):
                 alert_instruction = (
-                    "⚠️ PERINGATAN EDGE CASE (PENTING): Permintaan jumlah tempat wisata (atraksi) per hari dari user terlalu besar "
-                    "dan tidak realistis untuk diselesaikan dalam satu hari, sehingga sistem telah membatasinya menjadi "
-                    "maksimal 7 atraksi per hari. KAMU WAJIB secara eksplisit dan sopan memberi tahu user di dalam "
-                    "narasi `message_to_user` bahwa jumlah atraksi telah dikurangi/dibatasi demi kenyamanan perjalanan "
-                    "mereka (agar tidak terlalu lelah dan memiliki waktu kunjungan yang cukup)."
+                    "10. **PERINGATAN CAPPING (CRITICAL)**: User meminta jumlah atraksi yang MUSTAHIL/TERLALU BANYAK (lebih dari 7 tempat). "
+                    "Sistem backend TELAH MEMOTONG jadwalnya menjadi maksimal 7 atraksi per hari. "
+                    "Di dalam `message_to_user`, kamu DILARANG KERAS menyetujui permintaan user atau menyebutkan angka permintaan awal mereka (misal: JANGAN katakan 'menjelajahi 12 tempat'). "
+                    "Kamu WAJIB menyatakan dengan jelas di AWAL PARAGRAF bahwa jumlah tempat telah DIKURANGI/DIBATASI menjadi maksimal 7 tempat sehari agar jadwal tetap rasional, nyaman, dan tidak melelahkan."
                 )
 
             budget_rule_dynamic = ""
@@ -2438,7 +2437,8 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
             else:
                 mode_instruction = f"""
 ## MODE: GENERAL (Langsung Proses)
-- Jika user MENYAPA atau NGOBROL BIASA: response_type="chat". JANGAN panggil tool.
+- Jika user HANYA MENYAPA (Halo, Hai): response_type="chat".
+- Jika user MEMINTA HAL DI LUAR KAPASITAS (contoh: tiket pesawat, medis, rumah sakit, sewa motor): response_type="chat", dan KAMU WAJIB MENOLAK DENGAN RAMAH. Jelaskan bahwa kamu hanya mengurus wisata Bali. DILARANG membalas dengan sapaan template!
 - Jika user HANYA MINTA REKOMENDASI tanpa jadwal: panggil get_general_recommendations, response_type="recommendation".
 - Jika user MINTA ITINERARY LENGKAP → lanjut ke alur pembuatan.
   Jika tidak ada tanggal → asumsikan besok ({tomorrow_str}).
@@ -2572,13 +2572,30 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
                                 if func_name == "get_smart_recommendations" and func_args.get("category", "poi") == "poi":
                                     generated_schedule = func_result  # Keep the raw built days schedule list
                                     
-                                    # Create a clean text summary of the generated schedule
-                                    summary_lines = [
-                                        "SYSTEM INSTRUCTION KETAT: Berikut adalah jadwal harian yang telah disusun secara otomatis oleh backend. "
-                                        "KAMU WAJIB menuliskan narasi detail perjalanan (storytelling) dari Hari 1 hingga selesai di field `message_to_user` "
-                                        "menggunakan deskripsi dari tempat-tempat di bawah ini. JANGAN memberikan respon menggantung (seperti 'Mau saya mulai ceritakan?'). "
-                                        "LANGSUNG ceritakan dan jabarkan itinerary-nya di message_to_user!"
-                                    ]
+                                    # Detect if capping occurred based on tool arguments
+                                    req_pois = func_args.get("user_requested_pois", 0)
+                                    is_capped = False
+                                    if isinstance(req_pois, int) and req_pois > 7:
+                                        is_capped = True
+
+                                    summary_intro = (
+                                        "SYSTEM INSTRUCTION KETAT: Berikut adalah jadwal harian dari backend. "
+                                        "KAMU WAJIB menuliskan narasi detail dari Hari 1 hingga selesai di `message_to_user`. "
+                                        "DILARANG KERAS menutup narasi dengan pertanyaan menggantung atau menawarkan bantuan lagi (seperti 'Mau tanya lagi?', 'Ada yang bisa dibantu?'). LANGSUNG tutup dengan ucapan selamat liburan! "
+                                    )
+                                    
+                                    if not settings.enable_absolute_budget_calc:
+                                        summary_intro += "DILARANG KERAS menyebut estimasi biaya atau harga (Rp)! "
+                                        
+                                    if is_capped:
+                                        summary_intro += (
+                                            "CRITICAL WARNING (CAPPING): User meminta jumlah tempat yang MUSTAHIL (>7 tempat/hari). "
+                                            "Sistem TELAH MEMOTONGNYA menjadi maksimal 7 tempat agar rasional. "
+                                            "KAMU WAJIB memberitahu user DI PARAGRAF PERTAMA bahwa 'Jadwal dibatasi maksimal 7 tempat sehari agar tetap nyaman dan tidak kelelahan'. "
+                                            "DILARANG KERAS menyetujui jumlah mustahil yang diminta user! "
+                                        )
+
+                                    summary_lines = [summary_intro]
                                     for day_data in func_result:
                                         summary_lines.append(f"\nHari {day_data.get('day')} (Tema: {day_data.get('theme', 'Eksplorasi')}):")
                                         for p in day_data.get("places", []):
