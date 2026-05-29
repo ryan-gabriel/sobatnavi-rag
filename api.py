@@ -532,6 +532,11 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
 
 def recalculate_itinerary_budget(itinerary: dict) -> dict:
     """Hitung ulang total anggaran dan rincian budget berdasarkan daftar tempat saat ini."""
+    if not settings.enable_absolute_budget_calc:
+        itinerary["total_budget_idr"] = None
+        itinerary["budget_breakdown"] = None
+        return itinerary
+
     days = itinerary.get("itinerary_days", [])
     num_days = len(days)
     
@@ -1897,7 +1902,9 @@ def sanitize_ai_output(raw_dict: dict) -> dict:
                         place["category"] = category_map.get(cat, "attraction")
 
                     # Pastikan estimated_cost_idr tidak None
-                    if not place.get("estimated_cost_idr"):
+                    if not settings.enable_absolute_budget_calc:
+                        place["estimated_cost_idr"] = None
+                    elif not place.get("estimated_cost_idr"):
                         if place.get("category") == "restaurant":
                             place["estimated_cost_idr"] = 75000
                         else:
@@ -2319,13 +2326,22 @@ async def chat_with_heidi(
                     "mereka (agar tidak terlalu lelah dan memiliki waktu kunjungan yang cukup)."
                 )
 
+            budget_rule_dynamic = ""
+            if not settings.enable_absolute_budget_calc:
+                budget_rule_dynamic = (
+                    "9. **LARANGAN MEMBAHAS BIAYA (CRITICAL)**: Kamu DILARANG KERAS menambahkan bagian "
+                    "'Estimasi Budget', 'Rincian Biaya', atau menyebutkan nominal angka Rupiah (Rp) di akhir atau di dalam "
+                    "narasi `message_to_user`. Fitur kalkulasi harga saat ini sedang dinonaktifkan."
+                )
+
             replacements.update({
                 "PACE": poi_budget.get('pace_label', 'normal'),
                 "ATTRACTIONS_COUNT": poi_budget.get('attractions_per_day', 4),
                 "PREFERENCE_MODE": preference_mode,
                 "DAILY_POI_TARGETS": poi_budget.get('daily_targets', 'Default'),
                 "NUM_DAYS_HINT": num_days_hint,
-                "CAPPED_POI_ALERT_INSTRUCTION": alert_instruction
+                "CAPPED_POI_ALERT_INSTRUCTION": alert_instruction,
+                "BUDGET_RULE_DYNAMIC": budget_rule_dynamic
             })
             system_prompt = load_prompt_from_md("creator_agent.md", replacements)
             
@@ -2446,6 +2462,13 @@ STEP 6 → Tulis `message_to_user` berupa narasi storytelling yang hangat minima
 STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
 """
 
+            if not settings.enable_absolute_budget_calc:
+                rule_12_dynamic += (
+                    "\n13. **BIAYA WAJIB NULL**: Kamu DILARANG KERAS menyebutkan atau mengestimasikan "
+                    "biaya absolut di narasi. Untuk JSON output, field `estimated_cost_idr` WAJIB "
+                    "diisi dengan `null` (tanpa tanda kutip). Fokuslah pada vibe pengalaman."
+                )
+
             replacements.update({
                 "MODE_INSTRUCTION": mode_instruction,
                 "RULE_12_DYNAMIC": rule_12_dynamic,
@@ -2550,13 +2573,24 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
                                     generated_schedule = func_result  # Keep the raw built days schedule list
                                     
                                     # Create a clean text summary of the generated schedule
-                                    summary_lines = ["Berikut adalah jadwal harian yang telah disusun secara otomatis oleh backend Python untuk kamu:"]
+                                    summary_lines = [
+                                        "SYSTEM INSTRUCTION KETAT: Berikut adalah jadwal harian yang telah disusun secara otomatis oleh backend. "
+                                        "KAMU WAJIB menuliskan narasi detail perjalanan (storytelling) dari Hari 1 hingga selesai di field `message_to_user` "
+                                        "menggunakan deskripsi dari tempat-tempat di bawah ini. JANGAN memberikan respon menggantung (seperti 'Mau saya mulai ceritakan?'). "
+                                        "LANGSUNG ceritakan dan jabarkan itinerary-nya di message_to_user!"
+                                    ]
                                     for day_data in func_result:
                                         summary_lines.append(f"\nHari {day_data.get('day')} (Tema: {day_data.get('theme', 'Eksplorasi')}):")
                                         for p in day_data.get("places", []):
+                                            # Conditionally format cost information
+                                            cost_info = ""
+                                            if settings.enable_absolute_budget_calc:
+                                                cost_val = p.get('estimated_cost_idr') or 0
+                                                cost_info = f" Cost: Rp {cost_val:,} per orang."
+
                                             summary_lines.append(
                                                 f"  - {p.get('visit_time')} ({p.get('visit_duration_mins')} mnt): {p.get('name')} "
-                                                f"[{p.get('category')}]. Deskripsi: {p.get('description')}. Tips: {p.get('tips')}. Cost: Rp {p.get('estimated_cost_idr'):,} per orang."
+                                                f"[{p.get('category')}]. Deskripsi: {p.get('description')}. Tips: {p.get('tips')}.{cost_info}"
                                             )
                                     summary_text = "\n".join(summary_lines)
                                     logger.info("Interception: get_smart_recommendations output summarized for LLM.")
@@ -2678,42 +2712,47 @@ STEP 7 → Lengkapi `trip_title` dan `suggested_replies`.
 
             # 2. BUDGET RECALCULATION — Calculate deterministically based on injected itinerary and guaranteed hotel
             if parsed_data.itinerary_days:
-                num_days = len(parsed_data.itinerary_days)
-                num_nights = max(1, num_days - 1)
-                hotel_price = 850000
-                if parsed_data.base_hotel and parsed_data.base_hotel.price_per_night_idr:
-                    hotel_price = parsed_data.base_hotel.price_per_night_idr
-                
-                accommodation_idr = hotel_price * num_nights
-                
-                food_resto_cost = 0
-                for day in parsed_data.itinerary_days:
-                    for p in day.places:
-                        if p.category == "restaurant" and p.estimated_cost_idr:
-                            food_resto_cost += p.estimated_cost_idr
-                food_idr = food_resto_cost * 2 + 50000 * 2 * num_days
-                
-                transport_idr = 150000 * num_days
-                
-                entrance_fee_cost = 0
-                for day in parsed_data.itinerary_days:
-                    for p in day.places:
-                        if p.category == "attraction" and p.estimated_cost_idr:
-                            entrance_fee_cost += p.estimated_cost_idr
-                entrance_fee_idr = entrance_fee_cost * 2
-                
-                miscellaneous_idr = int((accommodation_idr + food_idr + transport_idr + entrance_fee_idr) * 0.12)
-                total_budget_idr = accommodation_idr + food_idr + transport_idr + entrance_fee_idr + miscellaneous_idr
-                
-                parsed_data.budget_breakdown = BudgetBreakdown(
-                    accommodation_idr=accommodation_idr,
-                    food_idr=food_idr,
-                    transport_idr=transport_idr,
-                    entrance_fee_idr=entrance_fee_idr,
-                    miscellaneous_idr=miscellaneous_idr
-                )
-                parsed_data.total_budget_idr = total_budget_idr
-                logger.info(f"Budget recalculated: Total={total_budget_idr}")
+                if not settings.enable_absolute_budget_calc:
+                    parsed_data.budget_breakdown = None
+                    parsed_data.total_budget_idr = None
+                else:
+                    num_days = len(parsed_data.itinerary_days)
+                    num_nights = max(1, num_days - 1)
+                    hotel_price = 850000
+                    if parsed_data.base_hotel and parsed_data.base_hotel.price_per_night_idr:
+                        hotel_price = parsed_data.base_hotel.price_per_night_idr
+                    
+                    accommodation_idr = hotel_price * num_nights
+                    
+                    food_resto_cost = 0
+                    for day in parsed_data.itinerary_days:
+                        for p in day.places:
+                            if p.category == "restaurant" and p.estimated_cost_idr:
+                                food_resto_cost += p.estimated_cost_idr
+                    food_idr = food_resto_cost * 2 + 50000 * 2 * num_days
+                    
+                    transport_idr = 150000 * num_days
+                    
+                    entrance_fee_cost = 0
+                    for day in parsed_data.itinerary_days:
+                        for p in day.places:
+                            if p.category == "attraction" and p.estimated_cost_idr:
+                                entrance_fee_cost += p.estimated_cost_idr
+                    entrance_fee_idr = entrance_fee_cost * 2
+                    
+                    miscellaneous_idr = int((accommodation_idr + food_idr + transport_idr + entrance_fee_idr) * 0.12)
+                    total_budget_idr = accommodation_idr + food_idr + transport_idr + entrance_fee_idr + miscellaneous_idr
+                    
+                    parsed_data.budget_breakdown = BudgetBreakdown(
+                        accommodation_idr=accommodation_idr,
+                        food_idr=food_idr,
+                        transport_idr=transport_idr,
+                        entrance_fee_idr=entrance_fee_idr,
+                        miscellaneous_idr=miscellaneous_idr
+                    )
+                    parsed_data.total_budget_idr = total_budget_idr
+                    logger.info(f"Budget recalculated: Total={total_budget_idr}")
+
 
             # 3. COORDINATE ENRICHMENT — Jika AI lupa isi lat/lng, backend ambil dari DB via place_id
             parsed_data = await enrich_place_coordinates(parsed_data)

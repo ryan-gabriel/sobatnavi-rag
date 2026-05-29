@@ -13,6 +13,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 from app.services.tomtom_service import _haversine_km
+from app.core.config import settings
 import numpy as np
 import logging
 import math
@@ -704,35 +705,38 @@ def map_to_place_item(item: dict, category: str, visit_time: str, visit_duration
             parts.append(f"dengan rating {item.get('rating')}/5")
         desc = ". ".join(parts) + "."
 
-    est_cost = item.get("estimated_cost_idr")
-    if est_cost is None:
-        if category == "restaurant":
-            pl = item.get("price_level") or meta.get("price_level") or meta.get("priceLevel") or "PRICE_LEVEL_MODERATE"
-            price_map = {
-                "PRICE_LEVEL_FREE": 0,
-                "PRICE_LEVEL_INEXPENSIVE": 50000,
-                "PRICE_LEVEL_MODERATE": 100000,
-                "PRICE_LEVEL_EXPENSIVE": 250000,
-                "PRICE_LEVEL_VERY_EXPENSIVE": 500000,
-            }
-            if isinstance(pl, int):
-                price_map_num = {0: 0, 1: 50000, 2: 120000, 3: 250000, 4: 500000}
-                est_cost = price_map_num.get(pl, 120000)
-            else:
-                est_cost = price_map.get(pl, 120000)
-        else:
-            pl = item.get("price_level") or meta.get("price_level") or meta.get("priceLevel")
-            if pl:
+    if not settings.enable_absolute_budget_calc:
+        est_cost = None
+    else:
+        est_cost = item.get("estimated_cost_idr")
+        if est_cost is None:
+            if category == "restaurant":
+                pl = item.get("price_level") or meta.get("price_level") or meta.get("priceLevel") or "PRICE_LEVEL_MODERATE"
                 price_map = {
                     "PRICE_LEVEL_FREE": 0,
-                    "PRICE_LEVEL_INEXPENSIVE": 15000,
-                    "PRICE_LEVEL_MODERATE": 35000,
-                    "PRICE_LEVEL_EXPENSIVE": 75000,
-                    "PRICE_LEVEL_VERY_EXPENSIVE": 150000,
+                    "PRICE_LEVEL_INEXPENSIVE": 50000,
+                    "PRICE_LEVEL_MODERATE": 100000,
+                    "PRICE_LEVEL_EXPENSIVE": 250000,
+                    "PRICE_LEVEL_VERY_EXPENSIVE": 500000,
                 }
-                est_cost = price_map.get(pl, 25000)
+                if isinstance(pl, int):
+                    price_map_num = {0: 0, 1: 50000, 2: 120000, 3: 250000, 4: 500000}
+                    est_cost = price_map_num.get(pl, 120000)
+                else:
+                    est_cost = price_map.get(pl, 120000)
             else:
-                est_cost = 25000
+                pl = item.get("price_level") or meta.get("price_level") or meta.get("priceLevel")
+                if pl:
+                    price_map = {
+                        "PRICE_LEVEL_FREE": 0,
+                        "PRICE_LEVEL_INEXPENSIVE": 15000,
+                        "PRICE_LEVEL_MODERATE": 35000,
+                        "PRICE_LEVEL_EXPENSIVE": 75000,
+                        "PRICE_LEVEL_VERY_EXPENSIVE": 150000,
+                    }
+                    est_cost = price_map.get(pl, 25000)
+                else:
+                    est_cost = 25000
 
     tags = item.get("tags") or meta.get("tags")
     if not tags:

@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     # Set to "false" to disable rate limiting (useful in tests / local dev)
     rate_limit_enabled: bool = True
 
+    # Feature Flags
+    # Set to "true" to enable deterministic absolute budget calculations
+    # (estimated_cost_idr, total_budget_idr, budget_breakdown).
+    # When false, all budget fields are set to null.
+    enable_absolute_budget_calc: bool = False
+
     @property
     def allowed_origins_list(self) -> List[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
